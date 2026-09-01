@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lanshare"
+version = "1.0.0"
+description = "Reasonably secure cross-platform LAN file sharing (Windows <-> Linux)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = ["cryptography>=3.4"]
+
+[project.scripts]
+lanshare = "lanshare.cli:main"
+
+[tool.setuptools]
+packages = ["lanshare"]
