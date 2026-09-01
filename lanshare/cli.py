@@ -215,16 +215,16 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
     return run_selftest()
 
 
+def _cmd_gui(args: argparse.Namespace) -> int:
+    from .gui.app import main as gui_main
+
+    return gui_main()
+
+
 def _parse_size(text: str) -> int:
-    text = text.strip().upper()
-    units = {"B": 1, "K": 1024, "KB": 1024, "KIB": 1024,
-             "M": 1024**2, "MB": 1024**2, "MIB": 1024**2,
-             "G": 1024**3, "GB": 1024**3, "GIB": 1024**3,
-             "T": 1024**4, "TB": 1024**4, "TIB": 1024**4}
-    for suffix in sorted(units, key=len, reverse=True):
-        if text.endswith(suffix) and text[: -len(suffix)].strip():
-            return int(float(text[: -len(suffix)].strip()) * units[suffix])
-    return int(text)
+    from .safety import parse_size
+
+    return parse_size(text)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -284,6 +284,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     pt = sub.add_parser("selftest", help="run a local loopback transfer self-test")
     pt.set_defaults(func=_cmd_selftest)
+
+    pg = sub.add_parser("gui", help="launch the desktop GUI")
+    pg.set_defaults(func=_cmd_gui)
 
     return p
 

@@ -8,6 +8,7 @@ import os
 import socket
 import ssl
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -44,6 +45,10 @@ _CHUNK = 1024 * 1024
 
 # An approval callback returns True to accept a transfer. Default is interactive.
 ApprovalFn = Callable[[Dict[str, Any]], bool]
+# Progress callback: (file_name, bytes_received, total_bytes).
+ProgressFn = Callable[[str, int, int], None]
+# Log callback: a human-readable status line (also always printed to console).
+LogFn = Callable[[str], None]
 
 
 def _interactive_approval(info: Dict[str, Any]) -> bool:
@@ -65,18 +70,34 @@ def _interactive_approval(info: Dict[str, Any]) -> bool:
 
 class Receiver:
     def __init__(self, config: Dict[str, Any], *, approval: Optional[ApprovalFn] = None,
-                 bind_host: str = "0.0.0.0"):
+                 bind_host: str = "0.0.0.0", progress_cb: Optional[ProgressFn] = None,
+                 log_cb: Optional[LogFn] = None):
         self.config = config
         self.approval = approval or _interactive_approval
         self.bind_host = bind_host
+        self.progress_cb = progress_cb
+        self.log_cb = log_cb
         self.download_dir = cfg_mod.get_download_dir(config)
         self.max_bytes = int(config.get("max_file_bytes"))
         self.secret = cfg_mod.load_secret()
         self.device_name = config["device_name"]
         self._responder: Optional[DiscoveryResponder] = None
         self.actual_port: Optional[int] = None
+        self._stop_flag = threading.Event()
 
     # -- lifecycle ----------------------------------------------------------
+
+    def stop(self) -> None:
+        """Ask a running serve_forever() loop to shut down (from any thread)."""
+        self._stop_flag.set()
+
+    def _log(self, msg: str, *, err: bool = False) -> None:
+        print(msg, file=sys.stderr if err else sys.stdout)
+        if self.log_cb:
+            try:
+                self.log_cb(msg)
+            except Exception:  # noqa: BLE001 -- a broken UI callback must not kill the server
+                pass
 
     def serve_forever(self) -> None:
         if not self.secret:
@@ -84,6 +105,7 @@ class Receiver:
                 "No shared secret set. Run 'lanshare set-secret' first "
                 "(and use the same secret on both devices)."
             )
+        self._stop_flag.clear()
         key_path, cert_path = identity.ensure_identity(self.device_name)
         server_fpr = identity.own_fingerprint() or ""
         ctx = server_context(cert_path, key_path)
@@ -92,6 +114,7 @@ class Receiver:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((self.bind_host, int(self.config["port"])))
         listener.listen(8)
+        listener.settimeout(0.5)  # periodic wake-up to check the stop flag
         self.actual_port = listener.getsockname()[1]
 
         if self.config.get("discovery_enabled", True):
@@ -102,19 +125,19 @@ class Receiver:
             try:
                 self._responder.start()
             except OSError as exc:
-                print(f"  (discovery disabled: {exc})", file=sys.stderr)
+                self._log(f"  (discovery disabled: {exc})", err=True)
                 self._responder = None
 
         self._print_banner(server_fpr)
 
         try:
-            while True:
+            while not self._stop_flag.is_set():
                 try:
                     raw_sock, addr = listener.accept()
-                except KeyboardInterrupt:
-                    raise
-                except OSError:
+                except socket.timeout:
                     continue
+                except OSError:
+                    break
                 self._handle_one(ctx, raw_sock, addr, server_fpr)
         finally:
             if self._responder:
@@ -122,15 +145,15 @@ class Receiver:
             listener.close()
 
     def _print_banner(self, server_fpr: str) -> None:
-        print(f"LANShare receiver '{self.device_name}' is ready.")
+        self._log(f"LANShare receiver '{self.device_name}' is ready.")
         addrs = local_ipv4_addresses()
         if addrs:
-            print(f"  Listening on : {', '.join(addrs)} port {self.actual_port}")
+            self._log(f"  Listening on : {', '.join(addrs)} port {self.actual_port}")
         else:
-            print(f"  Listening on port {self.actual_port}")
-        print(f"  Saving files to: {self.download_dir}")
-        print(f"  This device's fingerprint: {identity.fingerprint_pretty(server_fpr)}")
-        print("  Waiting for transfers... (Ctrl+C to stop)")
+            self._log(f"  Listening on port {self.actual_port}")
+        self._log(f"  Saving files to: {self.download_dir}")
+        self._log(f"  This device's fingerprint: {identity.fingerprint_pretty(server_fpr)}")
+        self._log("  Waiting for transfers... (Ctrl+C to stop)")
 
     # -- per-connection handling -------------------------------------------
 
@@ -138,7 +161,7 @@ class Receiver:
                     addr: Any, server_fpr: str) -> None:
         peer_ip = addr[0]
         if not is_lan_address(peer_ip):
-            print(f"  Rejected non-LAN connection from {peer_ip}", file=sys.stderr)
+            self._log(f"  Rejected non-LAN connection from {peer_ip}", err=True)
             raw_sock.close()
             return
 
@@ -162,10 +185,10 @@ class Receiver:
             self._session(tls, peer_ip, peer_name)
 
         except AuthError as exc:
-            print(f"  Auth failed from {peer_ip}: {exc}", file=sys.stderr)
+            self._log(f"  Auth failed from {peer_ip}: {exc}", err=True)
             _safe_send(tls, {"type": "error", "error": "authentication failed"})
         except (ProtocolError, ssl.SSLError, OSError) as exc:
-            print(f"  Connection from {peer_ip} ended: {exc}", file=sys.stderr)
+            self._log(f"  Connection from {peer_ip} ended: {exc}", err=True)
         finally:
             _close(tls, raw_sock)
 
@@ -192,7 +215,7 @@ class Receiver:
             validate_size(size if isinstance(size, int) else -1, self.max_bytes)
             check_free_space(self.download_dir, int(size))
         except UnsafeFileError as exc:
-            print(f"  Rejected offer from {peer_name}: {exc}", file=sys.stderr)
+            self._log(f"  Rejected offer from {peer_name}: {exc}", err=True)
             send_msg(tls, {"type": "decision", "accept": False, "reason": str(exc)})
             return
 
@@ -210,7 +233,7 @@ class Receiver:
             accepted = False
 
         if not accepted:
-            print(f"  Declined '{safe_name}' from {peer_name}")
+            self._log(f"  Declined '{safe_name}' from {peer_name}")
             send_msg(tls, {"type": "decision", "accept": False, "reason": "declined by user"})
             return
 
@@ -233,6 +256,11 @@ class Receiver:
                     fh.write(chunk)
                     hasher.update(chunk)
                     received += len(chunk)
+                    if self.progress_cb:
+                        try:
+                            self.progress_cb(dest.name, received, size)
+                        except Exception:  # noqa: BLE001
+                            pass
             actual_sha = hasher.hexdigest()
 
             if isinstance(declared_sha, str) and declared_sha:
@@ -240,7 +268,7 @@ class Receiver:
                     raise ProtocolError("sha256 mismatch -- file corrupted in transit")
 
             os.replace(tmp, dest)
-            print(f"  Saved '{dest.name}' ({human_size(size)}) from {peer_name}")
+            self._log(f"  Saved '{dest.name}' ({human_size(size)}) from {peer_name}")
             send_msg(tls, {
                 "type": "result", "ok": True,
                 "stored_as": dest.name, "sha256": actual_sha,

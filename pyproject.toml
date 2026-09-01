@@ -11,8 +11,11 @@ requires-python = ">=3.8"
 license = { text = "MIT" }
 dependencies = ["cryptography>=3.4"]
 
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+
 [project.scripts]
 lanshare = "lanshare.cli:main"
 
 [tool.setuptools]
-packages = ["lanshare"]
+packages = ["lanshare", "lanshare.gui", "lanshare.gui.pages"]

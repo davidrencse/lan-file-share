@@ -145,3 +145,20 @@ def human_size(num: int) -> str:
 
 def split_root_ext(name: str) -> Tuple[str, str]:
     return os.path.splitext(name)
+
+
+_SIZE_UNITS = {
+    "B": 1, "K": 1024, "KB": 1024, "KIB": 1024,
+    "M": 1024**2, "MB": 1024**2, "MIB": 1024**2,
+    "G": 1024**3, "GB": 1024**3, "GIB": 1024**3,
+    "T": 1024**4, "TB": 1024**4, "TIB": 1024**4,
+}
+
+
+def parse_size(text: str) -> int:
+    """Parse a human size string like '500M' or '20 GiB' into bytes."""
+    text = text.strip().upper()
+    for suffix in sorted(_SIZE_UNITS, key=len, reverse=True):
+        if text.endswith(suffix) and text[: -len(suffix)].strip():
+            return int(float(text[: -len(suffix)].strip()) * _SIZE_UNITS[suffix])
+    return int(text)

@@ -1,57 +1,88 @@
 # LANShare
 
-A small, **reasonably secure**, cross-platform file-sharing tool for devices on
-the same local network. It works in every direction — Windows → Linux,
-Linux → Windows, Linux → Linux, Windows → Windows — as long as both machines are
-on the same Wi‑Fi / LAN.
+**Reasonably secure, cross-platform file sharing for devices on the same local network.**
+Works in every direction — Windows → Linux, Linux → Windows, Linux → Linux, Windows → Windows —
+as long as both machines share a Wi-Fi network or LAN. Comes with both a desktop GUI and a
+scriptable CLI, built on the same encrypted, authenticated transfer engine.
+
+<p align="center">
+  <img src="docs/screenshots/dashboard.png" width="700" alt="LANShare dashboard">
+</p>
+
+## Why
+
+Dropping a file onto another machine on your own network shouldn't require a cloud account,
+a USB stick, or emailing it to yourself. LANShare sends files directly, peer-to-peer, over
+your LAN — encrypted, authenticated, and only after the receiving side explicitly approves it.
+
+## Screenshots
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/send-files.png" width="380" alt="Send files screen"><br><sub align="center">Pick files and a target device</sub></td>
+    <td><img src="docs/screenshots/incoming-request.png" width="380" alt="Incoming file approval dialog"><br><sub>Every transfer needs approval</sub></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/sending.png" width="380" alt="Live transfer progress"><br><sub>Live progress, speed, and logs</sub></td>
+    <td><img src="docs/screenshots/settings.png" width="380" alt="Settings screen"><br><sub>Pairing, ports, and security settings</sub></td>
+  </tr>
+</table>
+
+## Security model
 
 Every transfer is:
 
-- **Encrypted** with TLS 1.2+ (TLS 1.3 when both ends support it), using a
-  persistent self‑signed identity certificate generated per device.
-- **Authenticated** in both directions with a shared secret via an HMAC
-  challenge‑response that is *bound to the TLS certificate fingerprint*
-  (channel binding), so a man‑in‑the‑middle cannot relay a session.
-- **Approved by a human** on the receiving device before a single byte is
-  written (unless you explicitly opt into `--yes` for testing).
-- **Restricted to the local network** — connections from routable/public IP
-  addresses are refused.
-- **Written safely** — file names are sanitized, sizes are validated against a
-  limit and against free disk space, and files can only ever land inside the
-  configured download directory (no path traversal, no overwrites).
+- **Encrypted** with TLS 1.2+ (TLS 1.3 when both ends support it), using a persistent
+  self-signed identity certificate generated per device.
+- **Authenticated** in both directions with a shared secret via an HMAC challenge-response
+  bound to the TLS certificate fingerprint (channel binding), so a man-in-the-middle can't
+  relay a session.
+- **Approved by a human** on the receiving device before a single byte is written.
+- **Restricted to the local network** — connections from routable/public IP addresses are refused.
+- **Written safely** — file names are sanitized, sizes are checked against a limit and against
+  free disk space, and files can only ever land inside the configured download directory
+  (no path traversal, no silent overwrites).
 
-It is pure Python and depends only on the well‑known
-[`cryptography`](https://pypi.org/project/cryptography/) library.
-
----
-
-## Requirements
-
-- Python 3.8 or newer on each device.
-- The `cryptography` package.
+See [Security model in depth](#security-model-in-depth) below for the full threat model and honest limitations.
 
 ## Install
 
-On **each** device:
+Requires Python 3.8+.
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/davidrencse/lan-file-share.git
+cd lan-file-share
+pip install -r requirements.txt          # CLI only
+pip install -r requirements-gui.txt      # CLI + desktop GUI
 ```
 
-Optionally install the `lanshare` command:
+> **Arch / other externally-managed Python:** create a venv first —
+> `python -m venv .venv && source .venv/bin/activate` — then install as above.
+
+Optionally install the `lanshare` command itself:
 
 ```bash
-pip install .
+pip install .            # CLI
+pip install ".[gui]"     # CLI + GUI
 ```
 
-If you don't install it, run everything as `python -m lanshare ...` from this
-folder instead of `lanshare ...`.
+## Quick start (GUI)
 
----
+```bash
+python -m lanshare gui
+```
 
-## Quick start
+1. On first launch, LANShare generates this device's identity and a **shared secret**.
+   Open **Settings** to copy it.
+2. On the other device, launch LANShare too, open **Settings → Pair with another device's
+   secret**, and paste the value from step 1.
+3. On the device that should *receive*, flip the **Receiving** toggle on the Dashboard.
+4. On the sending device, click **Send Files**, pick files and a target (devices on the LAN
+   show up automatically), and hit **Send**.
+5. The receiving device gets an approval dialog for every file — nothing is written without
+   an explicit **Accept**.
 
-### 1. Initialise each device
+## Quick start (CLI)
 
 On device **A**:
 
@@ -59,77 +90,29 @@ On device **A**:
 lanshare init --name laptop-alice
 ```
 
-This generates the device's TLS identity and prints a freshly generated
-**shared secret**, e.g. `41fkBA77ZRC3iOiqrjMPkg`.
-
-### 2. Pair the other device with the same secret
-
-On device **B**, use the secret shown on A (both devices must share it):
+This prints a freshly generated **shared secret**. On device **B**, use that same secret:
 
 ```bash
 lanshare init --name desktop-bob
-lanshare set-secret 41fkBA77ZRC3iOiqrjMPkg
+lanshare set-secret <the-secret-from-A>
 ```
 
-> The shared secret is what authenticates devices to each other. Anyone who
-> knows it can send you files (still subject to your approval). Treat it like a
-> Wi‑Fi password: share it out‑of‑band, keep it off untrusted machines. You can
-> reprint it with `lanshare show-secret` or replace it with `lanshare set-secret`.
-
-### 3. Start the receiver on the device that will *receive*
+Start receiving on B:
 
 ```bash
 lanshare receive
 ```
 
-You'll see something like:
-
-```
-LANShare receiver 'desktop-bob' is ready.
-  Listening on : 192.168.1.42 port 51888
-  Saving files to: C:\Users\bob\LANShare received
-  This device's fingerprint: 96:8e:55:d1:...
-  Waiting for transfers... (Ctrl+C to stop)
-```
-
-### 4. Send from the other device
-
-Find receivers on the network:
+Send from A:
 
 ```bash
-lanshare discover
+lanshare discover                          # optional: find devices by name
+lanshare send 192.168.1.42 ./report.pdf    # or: lanshare send desktop-bob --find ./report.pdf
 ```
 
-Then send by IP:
+B is prompted to accept or decline each file before anything is written to disk.
 
-```bash
-lanshare send 192.168.1.42 ./report.pdf ./photo.jpg
-```
-
-…or by device name (resolved automatically via discovery):
-
-```bash
-lanshare send desktop-bob ./report.pdf --find
-```
-
-The receiver is prompted to **accept or decline** each file:
-
-```
-  Incoming file transfer request
-    From        : laptop-alice  (192.168.1.7)
-    File        : report.pdf
-    Size        : 2.4 MiB
-    Will save to: C:\Users\bob\LANShare received
-
-  Accept this file? [y/N]
-```
-
-On accept, the file is streamed, its SHA‑256 is verified on both ends, and it's
-saved atomically into the download directory.
-
----
-
-## Commands
+## CLI reference
 
 | Command | Description |
 |---|---|
@@ -141,26 +124,16 @@ saved atomically into the download directory.
 | `lanshare receive [--dir --port --name --no-discovery --yes]` | Run the receiver and wait for transfers. |
 | `lanshare send TARGET FILE... [--port --find]` | Send file(s) to a receiver (IP, or name with `--find`). |
 | `lanshare discover [--timeout N]` | List LANShare receivers on the network. |
+| `lanshare gui` | Launch the desktop GUI. |
 | `lanshare selftest` | Run a local loopback transfer to verify the install. |
-
-Useful options:
-
-- `lanshare config --dir "D:\Incoming"` — change where received files are saved.
-- `lanshare config --max-size 20G` — cap the size of files you'll accept.
-- `lanshare receive --port 52000` — use a non‑default TCP port (default `51888`).
-- `lanshare receive --yes` — **insecure**: auto‑accept every transfer. Testing only.
-
----
 
 ## Cross-platform notes
 
-- **Windows ↔ Linux both ways** are supported and tested; the wire protocol is
-  OS‑independent and file names are normalised safely for the receiving OS.
-- **Firewall:** the receiver listens on TCP `51888` and answers UDP discovery on
-  `51889`. Allow these on the receiver:
-  - *Windows:* the first run of `lanshare receive` usually triggers a Windows
-    Defender Firewall prompt — allow it on **Private** networks. Or, in an
-    elevated PowerShell:
+- **Windows ↔ Linux both ways** are supported and tested; the wire protocol is OS-independent
+  and file names are normalized safely for the receiving OS.
+- **Firewall:** the receiver listens on TCP `51888` and answers UDP discovery on `51889`.
+  - *Windows:* the first `lanshare receive` (or GUI "Receiving" toggle) usually triggers a
+    Defender Firewall prompt — allow it on **Private** networks. Or, in an elevated PowerShell:
     ```powershell
     New-NetFirewallRule -DisplayName "LANShare" -Direction Inbound -Protocol TCP -LocalPort 51888 -Action Allow -Profile Private
     New-NetFirewallRule -DisplayName "LANShare discovery" -Direction Inbound -Protocol UDP -LocalPort 51889 -Action Allow -Profile Private
@@ -170,12 +143,10 @@ Useful options:
     sudo ufw allow from 192.168.0.0/16 to any port 51888 proto tcp
     sudo ufw allow from 192.168.0.0/16 to any port 51889 proto udp
     ```
-- **Discovery** relies on UDP broadcast, which some networks (guest Wi‑Fi,
-  "client isolation", most corporate VLANs) block. If `discover` finds nothing,
-  send by IP directly — that always works as long as the two machines can reach
-  each other. Find a device's IP with `lanshare info` on that device.
-
----
+- **Discovery** relies on UDP broadcast, which some networks (guest Wi-Fi, client isolation,
+  most corporate VLANs) block. If nothing shows up, send/connect by IP directly — that always
+  works as long as the two machines can reach each other. Find a device's IP under its
+  Dashboard, or with `lanshare info`.
 
 ## Where things are stored
 
@@ -184,78 +155,55 @@ Useful options:
 | Config & identity | `%APPDATA%\LANShare` | `~/.config/lanshare` |
 | Received files (default) | `~\LANShare received` | `~/LANShare received` |
 
-Set `LANSHARE_HOME` to override the config directory (handy for running two
-instances on one machine, as the tests do).
+Set `LANSHARE_HOME` to override the config directory (handy for running two instances on one
+machine, as the tests do).
 
----
+## Security model in depth
 
-## Security model — what it does and doesn't protect
-
-**Threat model:** other devices on the same LAN, including a malicious one that
-can see traffic or try to connect to you.
+**Threat model:** other devices on the same LAN, including a malicious one that can see traffic
+or try to connect to you.
 
 What LANShare provides:
 
-1. **Confidentiality & integrity in transit** — TLS 1.2+/1.3 encrypts the
-   stream; a per‑file SHA‑256 is verified end‑to‑end.
-2. **Mutual authentication** — both ends prove knowledge of the shared secret
-   with an HMAC exchange over two random nonces. The HMAC also covers the
-   receiver's certificate fingerprint, so an attacker who intercepts the
-   connection (and therefore presents a *different* certificate) cannot produce
-   a valid exchange even though they can't read the secret. This is the same
-   channel‑binding idea used by SCRAM.
-3. **Trust on first use (TOFU)** — the sender remembers each receiver's
-   certificate fingerprint and warns loudly if a known device name later shows a
-   different fingerprint (possible impersonation, or a legitimate reinstall).
-4. **Explicit consent** — nothing is written without the receiving user saying
-   yes (outside `--yes` test mode).
-5. **Network scoping** — the receiver refuses connections whose source address
-   isn't loopback / link‑local / RFC1918‑private, and the sender refuses to
-   connect to non‑LAN addresses.
-6. **Safe file handling** — untrusted file names are reduced to a sanitized base
-   name (no directories, no `..`, no control characters, no Windows reserved
-   device names, length‑capped); the destination is verified to be inside the
-   download directory; existing files are never overwritten (`name (1).ext`);
-   declared sizes are checked against a configurable ceiling and free disk space;
-   incoming bytes are read to an exact count into a temp file and atomically
-   renamed only after the hash checks out.
+1. **Confidentiality & integrity in transit** — TLS 1.2+/1.3 encrypts the stream; a per-file
+   SHA-256 is verified end-to-end.
+2. **Mutual authentication** — both ends prove knowledge of the shared secret with an HMAC
+   exchange over two random nonces. The HMAC also covers the receiver's certificate
+   fingerprint, so an attacker who intercepts the connection (and therefore presents a
+   *different* certificate) cannot produce a valid exchange even though they don't know the
+   secret. This is the same channel-binding idea used by SCRAM.
+3. **Trust on first use (TOFU)** — the sender remembers each receiver's certificate fingerprint
+   and warns loudly if a known device name later shows a different fingerprint (possible
+   impersonation, or a legitimate reinstall).
+4. **Explicit consent** — nothing is written without the receiving user saying yes (outside
+   `--yes` test mode).
+5. **Network scoping** — the receiver refuses connections whose source address isn't
+   loopback/link-local/RFC1918-private, and the sender refuses to connect to non-LAN addresses.
+6. **Safe file handling** — untrusted file names are reduced to a sanitized base name (no
+   directories, no `..`, no control characters, no Windows reserved device names,
+   length-capped); the destination is verified to be inside the download directory; existing
+   files are never overwritten (`name (1).ext`); declared sizes are checked against a
+   configurable ceiling and free disk space; incoming bytes are written to a temp file and
+   atomically renamed only after the hash checks out.
 
 Honest limitations (it's "reasonably secure", not a hardened product):
 
-- The shared secret and TLS private key are stored on disk. On POSIX they're
-  written `0600` in a `0700` directory; on Windows they rely on your user
-  profile's ACL. Protect the machine accordingly.
-- Certificates are self‑signed; identity trust is TOFU + the shared secret, not
-  a CA. A brand‑new device is trusted the first time you talk to it.
-- Anyone who knows your shared secret can *offer* you files (you still approve
-  each one) and, if they also run a receiver, receive from you. Rotate the
-  secret (`lanshare set-secret`) if it leaks.
-- There's no rate limiting / brute‑force lockout; it's built for a home/office
-  LAN, not a hostile public network.
-
----
+- The shared secret and TLS private key are stored on disk. On POSIX they're written `0600`
+  in a `0700` directory; on Windows they rely on your user profile's ACL.
+- Certificates are self-signed; identity trust is TOFU + the shared secret, not a CA. A
+  brand-new device is trusted the first time you talk to it.
+- Anyone who knows your shared secret can *offer* you files (you still approve each one) and,
+  if they also run a receiver, receive from you. Rotate the secret if it leaks.
+- There's no rate limiting / brute-force lockout; it's built for a home/office LAN, not a
+  hostile public network.
 
 ## Development
 
-Run the test suite (no third‑party test runner required):
-
 ```bash
-python tests/test_lanshare.py
-```
-
-…or with pytest if you have it:
-
-```bash
-pytest -q
-```
-
-Verify a working transfer without a second machine:
-
-```bash
-python -m lanshare selftest
+python tests/test_lanshare.py   # or: pytest -q
+python -m lanshare selftest     # full loopback transfer, no second machine needed
 ```
 
 ## License
 
 MIT
-"# lan-file-share" 
