@@ -58,18 +58,46 @@ Requires Python 3.8+.
 ```bash
 git clone https://github.com/davidrencse/lan-file-share.git
 cd lan-file-share
-pip install -r requirements.txt          # CLI only
-pip install -r requirements-gui.txt      # CLI + desktop GUI
 ```
 
-> **Arch / other externally-managed Python:** create a venv first —
-> `python -m venv .venv && source .venv/bin/activate` — then install as above.
+### Arch Linux (and Hyprland/Sway)
 
-Optionally install the `lanshare` command itself:
+Arch marks its system Python as externally managed, so `pip install` is refused
+by design (`error: externally-managed-environment`, PEP 668). Everything
+LANShare needs is packaged, so install it with pacman and skip pip entirely:
 
 ```bash
-pip install .            # CLI
-pip install ".[gui]"     # CLI + GUI
+sudo pacman -S --needed python-cryptography pyside6 qt6-wayland
+python -m lanshare gui
+```
+
+`qt6-wayland` is what lets Qt run natively under a Wayland compositor such as
+Hyprland or Sway. Without it Qt falls back to XWayland, or fails with
+*"could not load the Qt platform plugin"*. If you hit that anyway, force
+XWayland with `QT_QPA_PLATFORM=xcb python -m lanshare gui`.
+
+### Debian 12+ / Ubuntu 23.04+ / Fedora 38+
+
+These also enforce PEP 668. Either use your distro's packages, or run the
+installer below, which puts everything in a project-local virtualenv.
+
+### Any Linux/macOS — scripted
+
+```bash
+./install.sh              # CLI + GUI into .venv
+./install.sh --cli-only   # no GUI toolkit
+./install.sh --desktop    # also add a launcher entry (wofi/rofi/GNOME)
+```
+
+The venv is created with `--system-site-packages`, so distro-provided PySide6
+and cryptography are reused rather than re-downloaded.
+
+### Windows / any system without PEP 668
+
+```bash
+pip install -r requirements.txt          # CLI only
+pip install -r requirements-gui.txt      # CLI + desktop GUI
+pip install ".[gui]"                     # or install the `lanshare` command
 ```
 
 ## Quick start (GUI)

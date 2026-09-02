@@ -9,10 +9,21 @@ from typing import List, Optional
 
 from . import DEFAULT_DISCOVERY_PORT, DEFAULT_PORT, __version__
 from . import config as cfg_mod
-from . import identity
+
+# NOTE: `identity` (and therefore `cryptography`) is imported lazily via
+# _identity(). Importing it here would turn a missing dependency into a bare
+# ModuleNotFoundError traceback before argparse -- or our own install advice --
+# ever runs.
+
+
+def _identity():
+    from . import identity as _mod
+
+    return _mod
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    identity = _identity()
     cfg = cfg_mod.load_config()
     if args.name:
         cfg["device_name"] = args.name
@@ -61,6 +72,7 @@ def _cmd_set_secret(args: argparse.Namespace) -> int:
 
 
 def _cmd_show_secret(args: argparse.Namespace) -> int:
+    identity = _identity()
     secret = cfg_mod.load_secret()
     if not secret:
         print("No shared secret set. Run 'lanshare init' or 'lanshare set-secret'.",
@@ -75,6 +87,7 @@ def _cmd_show_secret(args: argparse.Namespace) -> int:
 
 
 def _cmd_info(args: argparse.Namespace) -> int:
+    identity = _identity()
     from .netutil import local_ipv4_addresses
 
     cfg = cfg_mod.load_config()
@@ -202,6 +215,7 @@ def _cmd_send(args: argparse.Namespace) -> int:
 
 
 def _cmd_discover(args: argparse.Namespace) -> int:
+    identity = _identity()
     from .discovery import discover
 
     cfg = cfg_mod.load_config()
@@ -317,7 +331,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ImportError as exc:
+        # A missing third-party package should explain how to install itself on
+        # this system, not dump a ModuleNotFoundError traceback at the user.
+        from .deps import missing_dependency_help
+
+        name = getattr(exc, "name", None) or "a required package"
+        top = name.split(".")[0]
+        purpose = "for encrypted transfers" if top == "cryptography" else ""
+        print(missing_dependency_help(top, purpose=purpose), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -1,0 +1,12 @@
+# Shell scripts must keep LF endings even when committed from Windows -- a CRLF
+# shebang makes Linux fail with "bad interpreter: /usr/bin/env bash^M".
+*.sh text eol=lf
+
+# Python is fine either way, but keep it consistent in the repository.
+*.py text
+*.md text
+*.toml text
+*.txt text
+
+# Never touch binary assets.
+*.png binary

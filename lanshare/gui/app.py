@@ -10,13 +10,10 @@ def main() -> int:
         from PySide6.QtCore import QTimer
         from PySide6.QtWidgets import QApplication
     except ImportError:
-        print(
-            "The GUI requires PySide6. Install it with:\n"
-            "    pip install PySide6\n"
-            "or:\n"
-            "    pip install -r requirements-gui.txt",
-            file=sys.stderr,
-        )
+        from ..deps import missing_dependency_help
+
+        print(missing_dependency_help("PySide6", purpose="for the desktop GUI"),
+              file=sys.stderr)
         return 1
 
     from . import icons
