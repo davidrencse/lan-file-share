@@ -40,7 +40,7 @@ class ReceiverThread(QThread):
     log = Signal(str)
     incoming_request = Signal(dict, object)   # info, Responder(bool)
     progress = Signal(str, int, int)          # filename, received, total
-    file_saved = Signal(str)
+    completed = Signal(dict)                  # verified outcome, one per file
     error = Signal(str)
 
     # Slightly longer than the dialog's own countdown so the dialog always
@@ -64,17 +64,18 @@ class ReceiverThread(QThread):
             progress_cb=lambda name, received, total: self.progress.emit(
                 name, received, total
             ),
-            log_cb=self._on_log,
+            log_cb=self.log.emit,
+            complete_cb=self.completed.emit,
         )
         try:
             self._receiver.serve_forever()
         except Exception as exc:  # noqa: BLE001 -- surface any failure to the GUI
             self.error.emit(str(exc))
 
-    def _on_log(self, msg: str) -> None:
-        self.log.emit(msg)
-        if msg.strip().startswith("Saved '"):
-            self.file_saved.emit(msg)
+    @property
+    def receiver(self):
+        """The live Receiver, for diagnostics (refused addresses, discovery)."""
+        return self._receiver
 
     def _approval(self, info: Dict[str, Any]) -> bool:
         responder = Responder()

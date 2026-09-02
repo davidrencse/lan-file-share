@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from . import PROTOCOL_VERSION
 from . import config as cfg_mod
+from . import history
 from . import identity
 from .auth import AuthError, client_authenticate
 from .netutil import ProtocolError, is_lan_address, recv_msg, send_msg
@@ -120,7 +121,16 @@ def send_files(host: str, port: int, files: Sequence[str], *,
         raise SendError(f"cannot resolve host {host!r}: {exc}") from exc
     resolved_ip = infos[0][4][0]
     if not is_lan_address(resolved_ip):
-        raise SendError(f"refusing to connect to non-LAN address {resolved_ip}")
+        from .netutil import describe_local_networks
+
+        raise SendError(
+            f"{resolved_ip} is not on a network this device recognises as "
+            f"local, so the connection was not attempted ({describe_local_networks()}). "
+            f"If that really is your other computer -- some networks put Wi-Fi "
+            f"and Ethernet on separate subnets -- add its network under "
+            f"Settings, or with: lanshare config "
+            f"--trust-network {resolved_ip}/24"
+        )
 
     ctx = client_context()
     raw = socket.create_connection((resolved_ip, port), timeout=_CONNECT_TIMEOUT)
@@ -163,6 +173,7 @@ def send_files(host: str, port: int, files: Sequence[str], *,
             results.append(_send_one(tls, path, peer_name, show_progress, log,
                                      progress_cb, cancel_event))
 
+        _record_history(results, peer_name, resolved_ip)
         send_msg(tls, {"type": "bye"})
         return results
     except AuthError as exc:
@@ -175,6 +186,25 @@ def send_files(host: str, port: int, files: Sequence[str], *,
                 pass
         else:
             raw.close()
+
+
+def _record_history(results: List[Dict[str, Any]], peer_name: str,
+                    peer_ip: str) -> None:
+    """Log each outcome so the Files page can show what we sent, and where."""
+    for result in results:
+        path = Path(result["file"])
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if result.get("sent"):
+            history.record_sent(path.name, size, peer_name, peer_ip,
+                                status=history.OK)
+        else:
+            reason = str(result.get("reason", "not accepted"))
+            status = history.DECLINED if "declin" in reason.lower() else history.FAILED
+            history.record_sent(path.name, size, peer_name, peer_ip,
+                                status=status, error=reason)
 
 
 def _sha256_file(path: Path, progress_cb: Optional[ProgressFn],

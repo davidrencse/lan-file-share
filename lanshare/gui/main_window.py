@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QMainWindow, QPushButton, QStackedWidget, QVBoxLayout,
     QWidget,
@@ -14,6 +14,8 @@ from . import icons
 from .controller import AppController
 from .dialogs import IncomingRequestDialog
 from .pages.dashboard import DashboardPage
+from .pages.files import FilesPage
+from .pages.help import HelpPage
 from .pages.send import SendPage
 from .pages.settings import SettingsPage
 from .theme import PALETTE
@@ -53,25 +55,47 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # One declarative registry drives the stack, the sidebar and lookup.
+        # These used to be three hand-synchronised lists plus a literal
+        # key->index dict, so inserting a page anywhere but the end silently
+        # broke navigation.
+        self.dashboard_page = DashboardPage(self.controller)
+        self.send_page = SendPage(self.controller)
+        self.files_page = FilesPage(self.controller)
+        self.help_page = HelpPage(self.controller)
+        self.settings_page = SettingsPage(self.controller)
+
+        self._pages: List[Tuple[str, str, str, QWidget]] = [
+            ("dashboard", "Dashboard", "computer", self.dashboard_page),
+            ("send", "Send Files", "send", self.send_page),
+            ("files", "Files", "inbox", self.files_page),
+            ("help", "Help", "shield_check", self.help_page),
+            ("settings", "Settings", "sliders", self.settings_page),
+        ]
+        self._index_of = {key: i for i, (key, _t, _i, _w) in enumerate(self._pages)}
+
         layout.addWidget(self._build_sidebar())
 
         self.stack = QStackedWidget()
-        self.dashboard_page = DashboardPage(self.controller)
-        self.send_page = SendPage(self.controller)
-        self.settings_page = SettingsPage(self.controller)
-        self.stack.addWidget(self.dashboard_page)
-        self.stack.addWidget(self.send_page)
-        self.stack.addWidget(self.settings_page)
+        for _key, _title, _icon, widget in self._pages:
+            self.stack.addWidget(widget)
         layout.addWidget(self.stack, 1)
 
         self.dashboard_page.send_requested.connect(self._go_send)
-        self.send_page.back_requested.connect(lambda: self._go(0))
-        self.settings_page.back_requested.connect(lambda: self._go(0))
+        self.dashboard_page.help_requested.connect(lambda: self.go("help"))
+        for page in (self.send_page, self.files_page, self.help_page,
+                     self.settings_page):
+            if hasattr(page, "back_requested"):
+                page.back_requested.connect(lambda: self.go("dashboard"))
+        self.help_page.wizard_requested.connect(self._run_wizard)
 
         self.controller.incoming_request.connect(self._on_incoming_request)
         self.controller.start_discovery()
 
-        self._go(0)
+        self.go("dashboard")
+        # A brand-new install has nothing configured; walk the user through it
+        # rather than dropping them on a dashboard whose toggle refuses to move.
+        QTimer.singleShot(250, self._maybe_run_wizard)
 
     # -- sidebar --------------------------------------------------------
 
@@ -101,13 +125,9 @@ class MainWindow(QMainWindow):
         col.addSpacing(28)
 
         self.nav_buttons: List[Tuple[str, NavButton]] = []
-        for key, text, icon_name in (
-            ("dashboard", "Dashboard", "computer"),
-            ("send", "Send Files", "send"),
-            ("settings", "Settings", "sliders"),
-        ):
+        for key, text, icon_name, _widget in self._pages:
             btn = NavButton(text, icon_name)
-            btn.clicked.connect(lambda _checked=False, k=key: self._go_key(k))
+            btn.clicked.connect(lambda _checked=False, k=key: self.go(k))
             col.addWidget(btn)
             self.nav_buttons.append((key, btn))
 
@@ -135,21 +155,38 @@ class MainWindow(QMainWindow):
 
     # -- navigation -------------------------------------------------------
 
-    def _go_key(self, key: str) -> None:
-        mapping = {"dashboard": 0, "send": 1, "settings": 2}
-        self._go(mapping[key])
-
-    def _go(self, index: int, peer: Optional[object] = None) -> None:
+    def go(self, key: str, peer: Optional[object] = None) -> None:
+        """Switch to a page by name. Pages opt into refresh via on_show()."""
+        index = self._index_of.get(key)
+        if index is None:
+            return
         self.stack.setCurrentIndex(index)
-        for i, (_key, btn) in enumerate(self.nav_buttons):
-            btn.set_active(i == index)
-        if index == 0:
-            self.dashboard_page.refresh_device_info()
-        elif index == 1:
+        for btn_key, btn in self.nav_buttons:
+            btn.set_active(btn_key == key)
+        widget = self._pages[index][3]
+        if key == "send":
             self.send_page.reset_and_show(peer)
+        elif hasattr(widget, "on_show"):
+            widget.on_show()
 
     def _go_send(self, peer) -> None:
-        self._go(1, peer)
+        self.go("send", peer)
+
+    # -- first-run wizard ---------------------------------------------------
+
+    def _maybe_run_wizard(self) -> None:
+        cfg = self.controller.config
+        if not self.controller.has_secret() or not cfg.get("wizard_done"):
+            self._run_wizard()
+
+    def _run_wizard(self) -> None:
+        from .wizard import SetupWizard
+
+        wizard = SetupWizard(self.controller, self)
+        wizard.exec()
+        self.controller.reload_config()
+        self.controller.save_config({"wizard_done": True})
+        self.dashboard_page.on_show()
 
     # -- global incoming-transfer dialog ------------------------------------
 

@@ -13,6 +13,7 @@ POSIX systems. On Windows the files inherit the (already per-user) profile ACL.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -206,6 +207,25 @@ def save_secret(secret: str | bytes) -> None:
     write_private_bytes(tmp, secret)
     os.replace(tmp, path)
     _harden_file(path)
+
+
+def secret_fingerprint(secret: bytes | None = None) -> str | None:
+    """A short, safe-to-display ID for the shared secret ("Secret ID").
+
+    Two devices showing the same ID are paired with the same secret. That is
+    the one question the UI previously could not answer: with authenticated
+    discovery, a mismatched secret produces silence that looks exactly like
+    "nothing is out there".
+
+    Display only. This must never be broadcast or sent over the wire -- doing
+    so would hand an eavesdropper an offline check against guessed secrets.
+    """
+    if secret is None:
+        secret = load_secret()
+    if not secret:
+        return None
+    digest = hashlib.sha256(b"lanshare-secret-id|" + secret).hexdigest()
+    return digest[:6].upper()
 
 
 def generate_secret() -> str:

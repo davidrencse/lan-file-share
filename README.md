@@ -1,201 +1,196 @@
 # LANShare
 
-**Reasonably secure, cross-platform file sharing for devices on the same local network.**
-Works in every direction — Windows → Linux, Linux → Windows, Linux → Linux, Windows → Windows —
-as long as both machines share a Wi-Fi network or LAN. Comes with both a desktop GUI and a
-scriptable CLI, built on the same encrypted, authenticated transfer engine.
+Send files straight from one of your computers to another over your own Wi-Fi — no cloud
+account, no USB stick, no emailing things to yourself. Encrypted, and nothing is written until
+the person on the receiving end says yes.
+
+Works in every direction: Windows ⇄ Linux, Windows ⇄ Windows, Linux ⇄ Linux.
 
 <p align="center">
-  <img src="docs/screenshots/dashboard.png" width="700" alt="LANShare dashboard">
+  <img src="docs/screenshots/dashboard.png" width="760" alt="LANShare dashboard">
 </p>
 
-## Why
+---
 
-Dropping a file onto another machine on your own network shouldn't require a cloud account,
-a USB stick, or emailing it to yourself. LANShare sends files directly, peer-to-peer, over
-your LAN — encrypted, authenticated, and only after the receiving side explicitly approves it.
+# Set up in 5 minutes
 
-## Screenshots
+You do this once. Afterwards the two machines find each other on their own.
 
-<table>
-  <tr>
-    <td><img src="docs/screenshots/send-files.png" width="380" alt="Send files screen"><br><sub align="center">Pick files and a target device</sub></td>
-    <td><img src="docs/screenshots/incoming-request.png" width="380" alt="Incoming file approval dialog"><br><sub>Every transfer needs approval</sub></td>
-  </tr>
-  <tr>
-    <td><img src="docs/screenshots/sending.png" width="380" alt="Live transfer progress"><br><sub>Live progress, speed, and logs</sub></td>
-    <td><img src="docs/screenshots/settings.png" width="380" alt="Settings screen"><br><sub>Pairing, ports, and security settings</sub></td>
-  </tr>
-</table>
+The whole idea: **both devices need the same "shared secret"**. That's what proves they're
+allowed to talk to each other. You generate it on one machine and paste it on the other.
 
-## Security model
+## Step 1 — Install on your Windows PC
 
-Every transfer is:
+Open PowerShell in the folder you cloned this into:
 
-- **Encrypted** with TLS 1.2+ (TLS 1.3 when both ends support it), using a persistent
-  self-signed identity certificate generated per device.
-- **Authenticated** in both directions with a shared secret via an HMAC challenge-response
-  bound to the TLS certificate fingerprint (channel binding), so a man-in-the-middle can't
-  relay a session.
-- **Approved by a human** on the receiving device before a single byte is written — shown with
-  the true file name, stripped of invisible and text-direction characters that could otherwise
-  make an executable *look* like an image.
-- **Restricted to the local network** — connections from routable/public IP addresses are refused.
-- **Written safely** — file names are sanitized, sizes are checked against a limit and against
-  free disk space, and the destination is claimed atomically inside the configured download
-  directory (no path traversal, no overwrites, no races between concurrent transfers).
-
-Device discovery is authenticated too: a device only answers a discovery query that proves
-knowledge of the shared secret, so LANShare doesn't announce your hostname or certificate
-fingerprint to everyone on the network.
-
-See [Security model in depth](#security-model-in-depth) below for the full threat model and honest limitations.
-
-## Install
-
-Requires Python 3.8+.
-
-```bash
-git clone https://github.com/davidrencse/lan-file-share.git
-cd lan-file-share
+```powershell
+pip install -r requirements-gui.txt
+python -m lanshare gui
 ```
 
-### Arch Linux (and Hyprland/Sway)
+The app opens and walks you through naming the device and generating your shared secret.
 
-Arch marks its system Python as externally managed, so `pip install` is refused
-by design (`error: externally-managed-environment`, PEP 668). Everything
-LANShare needs is packaged, so install it with pacman and skip pip entirely:
+<p align="center">
+  <img src="docs/screenshots/wizard.png" width="560" alt="Setup wizard showing the shared secret">
+</p>
+
+**Copy that secret** — you need it in step 2. Note the **Secret ID** underneath it
+(`6D2994` in the picture). You'll use that to check the other machine matches.
+
+When you first switch **Receiving** on, Windows will ask whether to allow LANShare through the
+firewall. **Say yes, for private networks.** If you miss the prompt, run this in an
+Administrator PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "LANShare" -Direction Inbound -Protocol TCP -LocalPort 51888 -Action Allow -Profile Private
+New-NetFirewallRule -DisplayName "LANShare discovery" -Direction Inbound -Protocol UDP -LocalPort 51889 -Action Allow -Profile Private
+```
+
+## Step 2 — Install on your Arch / Hyprland laptop
+
+Arch won't let `pip` install into the system Python (that's PEP 668, and it's deliberate).
+Everything LANShare needs is packaged, so use pacman and skip pip entirely:
 
 ```bash
 sudo pacman -S --needed python-cryptography pyside6 qt6-wayland
 python -m lanshare gui
 ```
 
-`qt6-wayland` is what lets Qt run natively under a Wayland compositor such as
-Hyprland or Sway. Without it Qt falls back to XWayland, or fails with
-*"could not load the Qt platform plugin"*. If you hit that anyway, force
-XWayland with `QT_QPA_PLATFORM=xcb python -m lanshare gui`.
+> `qt6-wayland` is what lets the window open natively under Hyprland or Sway. Without it Qt
+> falls back to XWayland, or fails with *"could not load the Qt platform plugin"*. If that
+> still happens: `QT_QPA_PLATFORM=xcb python -m lanshare gui`.
 
-### Debian 12+ / Ubuntu 23.04+ / Fedora 38+
+Prefer a self-contained install instead? `./install.sh` builds a local `.venv` (no sudo), and
+`./install.sh --desktop` also adds a launcher entry so LANShare shows up in wofi/rofi.
 
-These also enforce PEP 668. Either use your distro's packages, or run the
-installer below, which puts everything in a project-local virtualenv.
+Now **paste the secret from step 1**: go to **Settings → "Pair with another device's secret"**
+→ paste → **Set**.
 
-### Any Linux/macOS — scripted
+## Step 3 — Check the Secret IDs match
 
-```bash
-./install.sh              # CLI + GUI into .venv
-./install.sh --cli-only   # no GUI toolkit
-./install.sh --desktop    # also add a launcher entry (wofi/rofi/GNOME)
+Look at the top-right of the Dashboard on **both** machines. They must show the **same Secret
+ID**:
+
+```
+SECRET ID (MUST MATCH)
+6D2994
 ```
 
-The venv is created with `--system-site-packages`, so distro-provided PySide6
-and cryptography are reused rather than re-downloaded.
+If they differ, the secret didn't paste correctly. Copy it again. This is by far the most
+common reason two devices can't see each other.
 
-### Windows / any system without PEP 668
+## Step 4 — Turn on Receiving where you want files to land
 
-```bash
-pip install -r requirements.txt          # CLI only
-pip install -r requirements-gui.txt      # CLI + desktop GUI
-pip install ".[gui]"                     # or install the `lanshare` command
-```
+Flip the **Receiving** switch on the Dashboard of whichever machine is receiving.
 
-## Quick start (GUI)
+**A device is invisible to everyone while Receiving is off.** If your other computer isn't
+showing up, this is the second thing to check.
 
-```bash
-python -m lanshare gui
-```
+## Step 5 — Send
 
-1. On first launch, LANShare generates this device's identity and a **shared secret**.
-   Open **Settings** to copy it.
-2. On the other device, launch LANShare too, open **Settings → Pair with another device's
-   secret**, and paste the value from step 1.
-3. On the device that should *receive*, flip the **Receiving** toggle on the Dashboard.
-4. On the sending device, click **Send Files**, pick files and a target (devices on the LAN
-   show up automatically), and hit **Send**.
-5. The receiving device gets an approval dialog for every file — nothing is written without
-   an explicit **Accept**.
+On the other machine: **Send Files** → pick the device → choose your files → **Send**. The
+receiving side gets a prompt showing who's sending, what the file is, and how big it is.
+Nothing is written to disk until it's accepted.
 
-## Quick start (CLI)
+<p align="center">
+  <img src="docs/screenshots/incoming-request.png" width="520" alt="Incoming file approval prompt">
+</p>
 
-On device **A**:
+Everything that arrives — and everything you send — is listed under **Files**, with a button to
+open it or show it in your file manager.
 
-```bash
-lanshare init --name laptop-alice
-```
+<p align="center">
+  <img src="docs/screenshots/files.png" width="760" alt="Files page listing sent and received transfers">
+</p>
 
-This prints a freshly generated **shared secret**. On device **B**, use that same secret:
+---
 
-```bash
-lanshare init --name desktop-bob
-lanshare set-secret <the-secret-from-A>
-```
+# If the devices can't see each other
 
-Start receiving on B:
+Click **"Why can't I see my other device?"** on the Dashboard. It checks everything it can from
+this side and tells you what it found.
 
-```bash
-lanshare receive
-```
+<p align="center">
+  <img src="docs/screenshots/troubleshoot.png" width="600" alt="Troubleshooting checks">
+</p>
 
-Send from A:
+| What you see | Usually means | Fix |
+|---|---|---|
+| "No devices found yet" | The other device has **Receiving off** | Turn Receiving on over there |
+| Still nothing, both receiving | **Secret IDs differ** | Compare the Secret ID on both Dashboards; re-paste the secret |
+| Nothing on Windows | **Firewall** blocked it | Allow LANShare on private networks (commands in step 1) |
+| Nothing on guest/office Wi-Fi | Network **blocks broadcast** | Use **Enter IP** with the address on the other device's Dashboard |
+| "not on a network this device recognises as local" | The two machines are on **different subnets** (e.g. one on Wi-Fi, one on Ethernet or a VPN) | `lanshare config --trust-network 192.168.1.0/24`, or turn the VPN off |
+| Devices appear but transfers hang | The receiving side has a **prompt waiting** | Approve it — it auto-declines after 2 minutes |
 
-```bash
-lanshare discover                          # optional: find devices by name
-lanshare send 192.168.1.42 ./report.pdf    # or: lanshare send desktop-bob --find ./report.pdf
-```
+**Which IP do I use?** The one labelled *"Others reach you at"* on the receiving device's
+Dashboard. Ignore the greyed-out "other adapters" line — those are VirtualBox/WSL/Docker
+adapters that other computers can't reach.
 
-B is prompted to accept or decline each file before anything is written to disk.
+The **Help** page inside the app has all of this, plus this device's address, Secret ID, and the
+exact firewall command for your OS.
 
-## CLI reference
+<p align="center">
+  <img src="docs/screenshots/help.png" width="760" alt="In-app help page">
+</p>
 
-| Command | Description |
+---
+
+# Command line
+
+The GUI and CLI share the same engine; anything you can do in one you can do in the other.
+
+| Command | What it does |
 |---|---|
-| `lanshare init [--name NAME]` | Generate identity + a shared secret (first run). |
-| `lanshare set-secret [SECRET]` | Set the shared secret (prompts if omitted). |
-| `lanshare show-secret` | Print the current secret and this device's fingerprint. |
-| `lanshare info` | Show configuration, paths, identity fingerprint, local IPs. |
-| `lanshare config [--name --dir --port --max-size --discovery]` | View/change persistent settings. |
-| `lanshare receive [--dir --port --name --no-discovery --yes]` | Run the receiver and wait for transfers. |
-| `lanshare send TARGET FILE... [--port --find]` | Send file(s) to a receiver (IP, or name with `--find`). |
-| `lanshare discover [--timeout N]` | List LANShare receivers on the network. |
-| `lanshare gui` | Launch the desktop GUI. |
-| `lanshare selftest` | Run a local loopback transfer to verify the install. |
+| `lanshare gui` | Open the desktop app |
+| `lanshare init [--name NAME]` | Generate this device's identity and a shared secret |
+| `lanshare set-secret [SECRET]` | Paste the secret from your other device |
+| `lanshare show-secret` | Print the secret and Secret ID for pairing |
+| `lanshare info` | Device name, **the address to give others**, Secret ID, local networks |
+| `lanshare receive` | Wait for incoming files (prompts before each one) |
+| `lanshare send TARGET FILE...` | Send to an IP, or to a device name with `--find` |
+| `lanshare discover` | List devices on the network |
+| `lanshare config --trust-network CIDR` | Treat another subnet as local |
+| `lanshare selftest` | Verify the install with a full loopback transfer |
 
-## Cross-platform notes
+Quick two-machine example:
 
-- **Windows ↔ Linux both ways** are supported and tested; the wire protocol is OS-independent
-  and file names are normalized safely for the receiving OS.
-- **Firewall:** the receiver listens on TCP `51888` and answers UDP discovery on `51889`.
-  - *Windows:* the first `lanshare receive` (or GUI "Receiving" toggle) usually triggers a
-    Defender Firewall prompt — allow it on **Private** networks. Or, in an elevated PowerShell:
-    ```powershell
-    New-NetFirewallRule -DisplayName "LANShare" -Direction Inbound -Protocol TCP -LocalPort 51888 -Action Allow -Profile Private
-    New-NetFirewallRule -DisplayName "LANShare discovery" -Direction Inbound -Protocol UDP -LocalPort 51889 -Action Allow -Profile Private
-    ```
-  - *Linux (ufw):*
-    ```bash
-    sudo ufw allow from 192.168.0.0/16 to any port 51888 proto tcp
-    sudo ufw allow from 192.168.0.0/16 to any port 51889 proto udp
-    ```
-- **Discovery** relies on UDP broadcast, sent out of every local interface (machines with
-  VirtualBox, WSL, Docker or VPN adapters have several, and querying only the default route
-  finds nothing or advertises an address the other side can't reach). Both devices must already
-  share the same secret, since queries are authenticated.
-  Some networks (guest Wi-Fi, client isolation, most corporate VLANs) block broadcast entirely.
-  If nothing shows up, send/connect by IP directly — that always works as long as the two
-  machines can reach each other. Find a device's IP under its Dashboard, or with `lanshare info`.
+```bash
+# on the receiving machine
+lanshare init --name desktop-bob     # prints the secret
+lanshare receive
 
-## Where things are stored
+# on the sending machine
+lanshare set-secret <the-secret>
+lanshare send desktop-bob ./report.pdf --find
+```
+
+## Install without the GUI
+
+```bash
+pip install -r requirements.txt        # CLI only, no Qt
+```
+
+On Debian 12+/Ubuntu 23.04+/Fedora 38+ (also PEP 668) use your distro's `python3-cryptography`
+package, or `./install.sh --cli-only`.
+
+---
+
+# Where things are kept
 
 | What | Windows | Linux/macOS |
 |---|---|---|
-| Config & identity | `%APPDATA%\LANShare` | `~/.config/lanshare` |
+| Settings, secret, identity key | `%APPDATA%\LANShare` | `~/.config/lanshare` |
+| Transfer history (`history.jsonl`) | same folder | same folder |
 | Received files (default) | `~\LANShare received` | `~/LANShare received` |
 
-Set `LANSHARE_HOME` to override the config directory (handy for running two instances on one
-machine, as the tests do).
+The history file records file names, sizes, and which device they came from, so the Files page
+survives a restart. **Clear history** on that page deletes it; it never touches the files
+themselves. Set `LANSHARE_HOME` to move the whole config directory.
 
-## Security model in depth
+---
+
+# Security model
 
 **Threat model:** other devices on the same LAN, including a malicious one that can see traffic
 or try to connect to you.
@@ -221,9 +216,14 @@ What LANShare provides:
    TOFU here reliably catches accidental key changes (a reinstall) rather than a deliberate
    impersonator.
 5. **Explicit consent** — nothing is written without the receiving user saying yes (outside
-   `--yes` test mode). The prompt shows the sanitized name that will actually be written.
-6. **Network scoping** — the receiver refuses connections whose source address isn't
-   loopback/link-local/RFC1918-private, and the sender refuses to connect to non-LAN addresses.
+   `--yes` test mode). The prompt shows the sanitized name that will actually be written, with
+   invisible and text-direction characters stripped so an executable cannot be dressed up as an
+   image.
+6. **Network scoping** — a peer is accepted only if it is loopback, link-local, RFC1918/ULA, or
+   **inside a network this machine actually has an interface on**. Testing only for "private
+   range" is a common shortcut and it is wrong: a real home Wi-Fi hands out `172.1.140.16/16`,
+   which is public address space, and the shortcut refused every peer on the user's own network.
+   Genuinely remote hosts are still refused.
 7. **Abuse resistance** — connections are handled concurrently (one silent peer cannot starve
    the receiver), bounded to a fixed number of slots, and repeated authentication failures from
    an address earn a cooldown.
@@ -248,17 +248,22 @@ Honest limitations (it's "reasonably secure", not a hardened product):
   With the generated secret (~128 bits) that is hopeless for them; with a short human-chosen
   one it is not. Prefer the generated value — `set-secret` requires at least 12 characters, but
   length alone is not strength.
+- The **Secret ID** shown in the UI is a truncated hash, for eyeballing that two devices match.
+  It is deliberately never transmitted; putting it on the network would give an eavesdropper an
+  offline check against guessed secrets.
 - Failed authentication is rate-limited per address, which blunts online guessing, but there is
   no account lockout or audit trail. It's built for a home/office LAN, not a hostile network.
 - IPv4 only. On an IPv6-only network it will not find or reach peers.
 
-## Development
+---
+
+# Development
 
 ```bash
 python tests/test_lanshare.py   # or: pytest -q
 python -m lanshare selftest     # full loopback transfer, no second machine needed
 ```
 
-## License
+# License
 
 MIT

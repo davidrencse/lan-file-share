@@ -16,11 +16,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from . import PROTOCOL_VERSION
 from . import config as cfg_mod
+from . import history
 from . import identity
 from .auth import AuthError, server_authenticate
 from .discovery import DiscoveryResponder
 from .netutil import (
     ProtocolError,
+    describe_local_networks,
     is_lan_address,
     local_ipv4_addresses,
     recv_msg,
@@ -57,6 +59,9 @@ ApprovalFn = Callable[[Dict[str, Any]], bool]
 ProgressFn = Callable[[str, int, int], None]
 # Log callback: a human-readable status line (also always printed to console).
 LogFn = Callable[[str], None]
+# Completion callback: fired once per file, only after the checksum is verified
+# and the file is in place, so the UI can show a truthful final state.
+CompleteFn = Callable[[Dict[str, Any]], None]
 
 
 def _interactive_approval(info: Dict[str, Any]) -> bool:
@@ -123,12 +128,18 @@ class _AuthThrottle:
 class Receiver:
     def __init__(self, config: Dict[str, Any], *, approval: Optional[ApprovalFn] = None,
                  bind_host: str = "0.0.0.0", progress_cb: Optional[ProgressFn] = None,
-                 log_cb: Optional[LogFn] = None):
+                 log_cb: Optional[LogFn] = None,
+                 complete_cb: Optional[CompleteFn] = None):
         self.config = config
         self.approval = approval or _interactive_approval
         self.bind_host = bind_host
         self.progress_cb = progress_cb
         self.log_cb = log_cb
+        self.complete_cb = complete_cb
+        # Set when the discovery responder could not bind, so the GUI can say
+        # so instead of leaving the user wondering why nobody sees them.
+        self.discovery_error: Optional[str] = None
+        self.refused_addresses: Dict[str, int] = {}
         self.download_dir = cfg_mod.get_download_dir(config)
         self.max_bytes = int(config.get("max_file_bytes"))
         self.secret = cfg_mod.load_secret()
@@ -183,7 +194,10 @@ class Receiver:
             try:
                 self._responder.start()
             except OSError as exc:
-                self._log(f"  (discovery disabled: {exc})", err=True)
+                self.discovery_error = str(exc)
+                self._log(f"  WARNING: discovery is off ({exc}) -- other devices "
+                          f"will not find this one automatically; they can still "
+                          f"connect by IP.", err=True)
                 self._responder = None
 
         self._print_banner(server_fpr)
@@ -256,7 +270,16 @@ class Receiver:
                     addr: Any, server_fpr: str) -> None:
         peer_ip = addr[0]
         if not is_lan_address(peer_ip):
-            self._log(f"  Rejected non-LAN connection from {peer_ip}", err=True)
+            # Counted so the Troubleshoot panel can say "we refused N
+            # connections from 172.1.x.x because it is not recognised as a
+            # local network" -- previously this only went to stderr, which the
+            # GUI never displayed, so it looked like nothing happened at all.
+            with self._log_lock:
+                self.refused_addresses[peer_ip] = \
+                    self.refused_addresses.get(peer_ip, 0) + 1
+            self._log(f"  Rejected connection from {peer_ip}: not on a network "
+                      f"this device recognises as local "
+                      f"({describe_local_networks()})", err=True)
             raw_sock.close()
             return
 
@@ -349,6 +372,8 @@ class Receiver:
 
         if not accepted:
             self._log(f"  Declined '{safe_name}' from {peer_name}")
+            history.record_received(safe_name, int(size), peer_name, peer_ip,
+                                    path=None, status=history.DECLINED)
             send_msg(tls, {"type": "decision", "accept": False, "reason": "declined by user"})
             return
 
@@ -364,13 +389,13 @@ class Receiver:
 
         try:
             send_msg(tls, {"type": "decision", "accept": True, "stored_as": dest.name})
-            self._receive_file(tls, dest, int(size), declared_sha, peer_name)
+            self._receive_file(tls, dest, int(size), declared_sha, peer_name, peer_ip)
         except BaseException:
             release_destination(dest)
             raise
 
     def _receive_file(self, tls: ssl.SSLSocket, dest: Path, size: int,
-                      declared_sha: Any, peer_name: str) -> None:
+                      declared_sha: Any, peer_name: str, peer_ip: str = "") -> None:
         tmp = partial_path(dest)
         hasher = hashlib.sha256()
         received = 0
@@ -398,6 +423,18 @@ class Receiver:
                     raise ProtocolError("sha256 mismatch -- file corrupted in transit")
 
             os.replace(tmp, dest)  # atomically replaces our own reservation
+            # Recorded only here: past the checksum check and past the rename,
+            # so a record of "ok" always means the file really is on disk and
+            # verified.
+            history.record_received(dest.name, size, peer_name, peer_ip,
+                                    path=str(dest), status=history.OK)
+            if self.complete_cb:
+                try:
+                    self.complete_cb({"name": dest.name, "size": size,
+                                      "path": str(dest), "peer_name": peer_name,
+                                      "status": history.OK})
+                except Exception:  # noqa: BLE001
+                    pass
             self._log(f"  Saved '{dest.name}' ({human_size(size)}) from {peer_name}")
             send_msg(tls, {
                 "type": "result", "ok": True,
@@ -409,6 +446,16 @@ class Receiver:
                     tmp.unlink()
             except OSError:
                 pass
+            history.record_received(dest.name, size, peer_name, peer_ip,
+                                    path=None, status=history.FAILED,
+                                    error=str(exc))
+            if self.complete_cb:
+                try:
+                    self.complete_cb({"name": dest.name, "size": size,
+                                      "path": None, "peer_name": peer_name,
+                                      "status": history.FAILED, "error": str(exc)})
+                except Exception:  # noqa: BLE001
+                    pass
             # Detail stays local; the peer gets a generic reason so local paths
             # and disk layout are not disclosed over the wire.
             self._log(f"  Transfer of '{dest.name}' failed: {exc}", err=True)

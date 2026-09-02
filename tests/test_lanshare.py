@@ -561,6 +561,105 @@ def test_idle_connection_does_not_block_other_transfers():
         receiver.stop()
 
 
+# --- transfer history -------------------------------------------------------
+
+def test_history_records_and_orders():
+    from lanshare import history
+
+    history.clear()
+    history.record_received("a.txt", 10, "Peer", "192.168.1.5", path="/tmp/a.txt")
+    history.record_sent("b.bin", 20, "Peer", "192.168.1.5")
+    records = history.load()
+    assert len(records) == 2
+    assert records[0].name == "b.bin", "most recent must come first"
+    assert records[0].direction == history.SENT
+    assert records[1].direction == history.RECEIVED
+    assert records[1].path == "/tmp/a.txt"
+    history.clear()
+    assert history.load() == []
+
+
+def test_history_survives_a_corrupt_line():
+    from lanshare import history
+
+    history.clear()
+    history.record_received("good.txt", 1, "P", "192.168.1.5", path=None)
+    with open(history.history_path(), "a", encoding="utf-8") as fh:
+        fh.write("{not json at all\n")          # e.g. a truncated write
+        fh.write('{"direction":"sent"}\n')      # valid JSON, missing fields
+    records = history.load()
+    assert [r.name for r in records] == ["good.txt"]
+    history.clear()
+
+
+def test_history_is_thread_safe():
+    """The receiver appends from up to 8 concurrent transfer threads."""
+    from lanshare import history
+
+    history.clear()
+
+    def writer(n):
+        for i in range(20):
+            history.record_received(f"f{n}-{i}.bin", i, "P", "192.168.1.5", path=None)
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(20)
+    records = history.load(limit=1000)
+    assert len(records) == 120, f"lost records under concurrency: {len(records)}"
+    history.clear()
+
+
+def test_history_trims_to_cap():
+    from lanshare import history
+
+    history.clear()
+    for i in range(history.MAX_RECORDS + 80):
+        history.record_sent(f"f{i}.bin", 1000, "P", "192.168.1.5")
+    records = history.load(limit=10_000)
+    assert len(records) <= history.MAX_RECORDS
+    assert records[0].name == f"f{history.MAX_RECORDS + 79}.bin"
+    history.clear()
+
+
+# --- secret ID ---------------------------------------------------------------
+
+def test_secret_fingerprint_is_stable_and_distinct():
+    from lanshare import config as cfg_mod
+
+    a = cfg_mod.secret_fingerprint(b"one-shared-secret-value")
+    b = cfg_mod.secret_fingerprint(b"one-shared-secret-value")
+    c = cfg_mod.secret_fingerprint(b"a-different-secret-value")
+    assert a == b and a != c
+    assert len(a) == 6 and a.isalnum()
+    assert cfg_mod.secret_fingerprint(b"") is None
+
+
+def test_secret_fingerprint_never_goes_on_the_wire():
+    """It is a display aid. Broadcasting it would let an eavesdropper test
+    guessed secrets offline."""
+    from lanshare import config as cfg_mod
+    from lanshare.discovery import DiscoveryResponder, _b64, _mac
+
+    secret = b"a-shared-secret-for-the-wire-test"
+    fingerprint = cfg_mod.secret_fingerprint(secret)
+    assert fingerprint
+
+    nonce = b"q" * 16
+    import json as _json
+    query = _json.dumps({"magic": "lanshare-discovery-v2", "kind": "query",
+                         "nonce": _b64(nonce),
+                         "mac": _b64(_mac(secret, "query", nonce))}).encode()
+    responder = DiscoveryResponder("Box", 51888, 51889, "ab" * 32, secret)
+    reply = responder._build_reply(query)
+    assert reply is not None
+    assert fingerprint.encode() not in reply
+    assert fingerprint.lower().encode() not in reply.lower()
+    assert secret not in reply
+
+
 def _main():
     funcs = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

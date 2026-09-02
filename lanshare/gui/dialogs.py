@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import icons
+from .. import config as cfg_mod
 from ..safety import human_size
 from .theme import PALETTE
 from .widgets import Badge, button, divider, h_spacer, label
@@ -179,6 +180,148 @@ class TofuWarningDialog(_BaseDialog):
 
 def _pretty_fpr(hex_fpr: str) -> str:
     return ":".join(hex_fpr[i:i + 2] for i in range(0, len(hex_fpr), 2))
+
+
+class TroubleshootDialog(_BaseDialog):
+    """Reports what this device can actually check, and states what it can't.
+
+    Authenticated discovery means a wrong secret produces silence that looks
+    exactly like an empty network, so the app has to explain the difference
+    rather than leaving the user to guess between three invisible causes.
+    """
+
+    def __init__(self, controller, parent: Optional[QWidget] = None):
+        super().__init__("Why can't I see my other device?", parent)
+        self.controller = controller
+        self.setMinimumWidth(560)
+
+        self.body().addWidget(label("Checks on this device", "h2"))
+        self._rows = QVBoxLayout()
+        self.body().addLayout(self._rows)
+        self.body().addWidget(divider())
+
+        other = label(
+            "This device cannot check the other one for you. On that device, "
+            "confirm: LANShare is open, Receiving is switched on, and the "
+            "Secret ID shown on its dashboard is identical to this one.",
+            "secondary")
+        other.setWordWrap(True)
+        self.body().addWidget(other)
+
+        self._action_row = QHBoxLayout()
+        self.body().addLayout(self._action_row)
+
+        btns = QHBoxLayout()
+        btns.addWidget(h_spacer())
+        recheck = button("Re-check", cls="secondary", icon_name="refresh")
+        recheck.clicked.connect(self._run_checks)
+        btns.addWidget(recheck)
+        close = button("Close", cls="primary", icon_color=PALETTE.text_on_accent)
+        close.clicked.connect(self.accept)
+        btns.addWidget(close)
+        self.body().addLayout(btns)
+
+        self._run_checks()
+
+    def _add(self, ok: Optional[bool], title: str, detail: str) -> None:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        from PySide6.QtWidgets import QLabel
+        mark = QLabel()
+        name, colour = (("check_circle", PALETTE.success) if ok is True else
+                        ("x_circle", PALETTE.danger) if ok is False else
+                        ("alert_triangle", PALETTE.warning))
+        mark.setPixmap(icons.pixmap(name, size=16, color=colour))
+        mark.setFixedWidth(20)
+        row.addWidget(mark, 0)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        col.addWidget(label(title, "body"))
+        det = label(detail, "muted")
+        det.setWordWrap(True)
+        col.addWidget(det)
+        row.addLayout(col, 1)
+        holder = QWidget()
+        holder.setLayout(row)
+        self._rows.addWidget(holder)
+
+    def _clear(self, layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+
+    def _run_checks(self) -> None:
+        from ..netutil import describe_local_networks, primary_lan_address
+
+        self._clear(self._rows)
+        self._clear(self._action_row)
+        self.controller.reload_config()
+
+        secret_id = cfg_mod.secret_fingerprint()
+        self._add(secret_id is not None, "Shared secret",
+                  f"Secret ID {secret_id} — the other device must show exactly "
+                  f"this." if secret_id else
+                  "No secret set on this device. Open Help and run setup.")
+
+        receiving = self.controller.is_receiving()
+        self._add(receiving, "Receiving",
+                  "On — this device is visible to others." if receiving else
+                  "Off. Other devices cannot see this one, and cannot send to "
+                  "it, while Receiving is off.")
+
+        receiver = self.controller.live_receiver()
+        disc_err = getattr(receiver, "discovery_error", None) if receiver else None
+        if not receiving:
+            self._add(None, "Discovery", "Not running (Receiving is off).")
+        elif disc_err:
+            self._add(False, "Discovery",
+                      f"Could not start: {disc_err}. Others will not find this "
+                      f"device automatically, but can still connect by IP.")
+        else:
+            self._add(True, "Discovery", "Answering queries on the network.")
+
+        addr = primary_lan_address()
+        port = self.controller.config["port"]
+        self._add(addr is not None, "This device's address",
+                  f"{addr}, port {port} — type this into 'Enter IP' on the "
+                  f"other device if discovery is blocked." if addr else
+                  "No network address detected. Are you connected to Wi-Fi?")
+
+        self._add(None, "Networks treated as local", describe_local_networks())
+
+        refused = dict(getattr(receiver, "refused_addresses", {}) or {}) if receiver else {}
+        if refused:
+            listing = ", ".join(f"{ip} ({n}x)" for ip, n in list(refused.items())[:4])
+            self._add(False, "Refused connections",
+                      f"Turned away {listing} — not on a network this device "
+                      f"recognises as local. If that is your other computer, "
+                      f"trust its network below.")
+            trust = button("Trust these networks", cls="secondary",
+                           icon_name="shield_check")
+            trust.clicked.connect(lambda: self._trust(list(refused)))
+            self._action_row.addWidget(h_spacer())
+            self._action_row.addWidget(trust)
+
+    def _trust(self, addresses) -> None:
+        """Add the /24 around each refused address to the allow list."""
+        import ipaddress
+
+        cfg = self.controller.config
+        nets = list(cfg.get("extra_local_networks") or [])
+        for addr in addresses:
+            try:
+                net = ipaddress.ip_network(f"{addr}/24", strict=False)
+            except ValueError:
+                continue
+            if str(net) not in nets:
+                nets.append(str(net))
+        self.controller.save_config({"extra_local_networks": nets})
+        receiver = self.controller.live_receiver()
+        if receiver is not None:
+            receiver.refused_addresses.clear()
+        self._run_checks()
 
 
 class ManualTargetDialog(_BaseDialog):

@@ -18,6 +18,7 @@ class AppController(QObject):
     receiver_log = Signal(str)
     incoming_request = Signal(dict, object)
     receive_progress = Signal(str, int, int)
+    receive_complete = Signal(dict)
     receiver_error = Signal(str)
     peers_changed = Signal(list)
 
@@ -50,6 +51,12 @@ class AppController(QObject):
     def is_receiving(self) -> bool:
         return bool(self.receiver_thread and self.receiver_thread.isRunning())
 
+    def live_receiver(self):
+        """The running Receiver instance, if any, for diagnostics."""
+        if self.receiver_thread is None:
+            return None
+        return getattr(self.receiver_thread, "receiver", None)
+
     def start_receiving(self) -> None:
         if self.is_receiving():
             return
@@ -58,6 +65,7 @@ class AppController(QObject):
         thread.log.connect(self.receiver_log)
         thread.incoming_request.connect(self.incoming_request)
         thread.progress.connect(self.receive_progress)
+        thread.completed.connect(self.receive_complete)
         thread.error.connect(self._on_receiver_error)
         thread.finished.connect(self._on_receiver_finished)
         self.receiver_thread = thread

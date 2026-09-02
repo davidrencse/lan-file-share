@@ -19,8 +19,9 @@ from ..widgets import (
     Badge, Card, EmptyState, ProgressRow, ToggleSwitch, button, divider,
     h_spacer, icon_button, label,
 )
+from ... import config as cfg_mod
 from ... import identity
-from ...netutil import local_ipv4_addresses
+from ...netutil import describe_addresses, primary_lan_address
 
 
 def _fpr_short(fpr: str) -> str:
@@ -56,6 +57,7 @@ class PeerRow(QWidget):
 
 class DashboardPage(QWidget):
     send_requested = Signal(object)  # Peer or None
+    help_requested = Signal()
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -72,6 +74,10 @@ class DashboardPage(QWidget):
         title_col.addWidget(label("LANShare", "h1"))
         header.addLayout(title_col)
         header.addWidget(h_spacer())
+        folder_btn = button("Downloads folder", cls="secondary", icon_name="folder")
+        folder_btn.setMinimumHeight(38)
+        folder_btn.clicked.connect(self._open_downloads)
+        header.addWidget(folder_btn)
         send_btn = button("Send Files", cls="primary", icon_name="send",
                           icon_color=PALETTE.text_on_accent)
         send_btn.setMinimumHeight(38)
@@ -86,6 +92,7 @@ class DashboardPage(QWidget):
         controller.receiving_changed.connect(self._on_receiving_changed)
         controller.receiver_error.connect(self._on_receiver_error)
         controller.receive_progress.connect(self._on_progress)
+        controller.receive_complete.connect(self._on_receive_complete)
         controller.peers_changed.connect(self._on_peers)
 
     # -- cards ------------------------------------------------------------
@@ -102,24 +109,44 @@ class DashboardPage(QWidget):
         col.setSpacing(2)
         self.name_label = label(self.controller.config["device_name"], "h2")
         col.addWidget(self.name_label)
-        addrs = local_ipv4_addresses()
-        addr_txt = ", ".join(addrs) if addrs else "no network address detected"
-        col.addWidget(label(f"{addr_txt}  ·  port {self.controller.config['port']}",
-                            "secondary"))
+        # One address, not a list. This used to print every adapter -- Wi-Fi,
+        # WSL and VirtualBox alike -- leaving no way to tell which one another
+        # computer should actually be given.
+        addr_row = QHBoxLayout()
+        addr_row.setSpacing(6)
+        addr_row.addWidget(label("Others reach you at", "secondary"))
+        self.addr_label = label("", "mono")
+        self.addr_label.setStyleSheet(f"color: {PALETTE.text}; font-size: 13px;")
+        addr_row.addWidget(self.addr_label)
+        copy_addr = icon_button("copy", size=13, tooltip="Copy this address")
+        copy_addr.clicked.connect(
+            lambda: QApplication.clipboard().setText(self._primary_addr or ""))
+        addr_row.addWidget(copy_addr)
+        addr_row.addWidget(h_spacer())
+        col.addLayout(addr_row)
+        self.other_addr_label = label("", "muted")
+        self.other_addr_label.setWordWrap(True)
+        col.addWidget(self.other_addr_label)
         row.addLayout(col, 1)
 
-        fpr_col = QVBoxLayout()
-        fpr_col.setAlignment(Qt.AlignRight)
-        fpr_col.setSpacing(2)
-        fpr_col.addWidget(label("IDENTITY FINGERPRINT", "eyebrow"))
-        fpr_row = QHBoxLayout()
+        ids_col = QVBoxLayout()
+        ids_col.setAlignment(Qt.AlignRight)
+        ids_col.setSpacing(2)
+        ids_col.addWidget(label("SECRET ID (MUST MATCH)", "eyebrow"))
+        sid_row = QHBoxLayout()
+        self.secret_id_label = label("", "mono")
+        self.secret_id_label.setStyleSheet(
+            f"color: {PALETTE.text}; font-size: 15px; font-weight: 600;")
+        sid_row.addWidget(self.secret_id_label)
+        sid_copy = icon_button("copy", size=13, tooltip="Copy Secret ID")
+        sid_copy.clicked.connect(
+            lambda: QApplication.clipboard().setText(self.secret_id_label.text()))
+        sid_row.addWidget(sid_copy)
+        ids_col.addLayout(sid_row)
         self.fpr_label = label(_fpr_short(self.controller.fingerprint), "mono")
-        fpr_row.addWidget(self.fpr_label)
-        copy_btn = icon_button("copy", size=14, tooltip="Copy full fingerprint")
-        copy_btn.clicked.connect(self._copy_fingerprint)
-        fpr_row.addWidget(copy_btn)
-        fpr_col.addLayout(fpr_row)
-        row.addLayout(fpr_col)
+        self.fpr_label.setToolTip("This device's TLS identity fingerprint")
+        ids_col.addWidget(self.fpr_label)
+        row.addLayout(ids_col)
 
         card.addLayout(row)
         return card
@@ -181,21 +208,47 @@ class DashboardPage(QWidget):
         self.peers_col.setSpacing(10)
         card.addLayout(self.peers_col)
 
-        self.empty_state = EmptyState(
-            "wifi", "No devices found yet",
-            "Make sure the other device is on and connected to this Wi-Fi/LAN.")
+        self.empty_state = self._build_empty_state()
         self.peers_col.addWidget(self.empty_state)
 
         return card
+
+    def _build_empty_state(self) -> QWidget:
+        """Empty state that offers a way forward instead of a dead end."""
+        wrap = QWidget()
+        col = QVBoxLayout(wrap)
+        col.setSpacing(10)
+        col.addWidget(EmptyState(
+            "wifi", "No devices found yet",
+            "A device appears here only while it has Receiving switched on, "
+            "and both devices must show the same Secret ID."))
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(h_spacer())
+        trouble = button("Why can't I see my other device?", cls="secondary",
+                         icon_name="alert_triangle")
+        trouble.clicked.connect(self._open_troubleshoot)
+        btn_row.addWidget(trouble)
+        btn_row.addWidget(h_spacer())
+        col.addLayout(btn_row)
+        return wrap
+
+    def _open_troubleshoot(self) -> None:
+        from ..dialogs import TroubleshootDialog
+
+        TroubleshootDialog(self.controller, self).exec()
+        self.on_show()
 
     # -- behaviour ----------------------------------------------------------
 
     def _on_toggle(self, checked: bool) -> None:
         if checked:
             if not self.controller.has_secret():
+                # Snapping the toggle back with a one-line explanation was a
+                # dead end; send the user somewhere that can fix it.
                 self.toggle.setChecked(False, animate=False)
                 self.receiving_sub.setText(
-                    "No shared secret is set yet -- set one in Settings first.")
+                    "No shared secret yet — open Help to set this device up.")
+                self.help_requested.emit()
                 return
             self.controller.start_receiving()
         else:
@@ -229,7 +282,9 @@ class DashboardPage(QWidget):
         row.set_phase("Receiving...")
         row.set_progress(received, total)
         if received >= total:
-            row.set_done(True, "Saved")
+            # All bytes are in, but the checksum has not been checked yet.
+            # The real outcome arrives via _on_receive_complete().
+            row.set_phase("Verifying...")
 
     def _trim_progress_rows(self, keep: int = 4) -> None:
         """Drop the oldest finished rows so the card cannot grow without bound."""
@@ -255,6 +310,25 @@ class DashboardPage(QWidget):
     def _copy_fingerprint(self) -> None:
         QApplication.clipboard().setText(self.controller.fingerprint)
 
+    def _open_downloads(self) -> None:
+        from .files import open_path
+
+        open_path(cfg_mod.get_download_dir(self.controller.config))
+
+    def _on_receive_complete(self, info: dict) -> None:
+        """Final, truthful state for a received file.
+
+        Previously the row flipped to "Saved" as soon as the byte count was
+        reached -- before the checksum was verified and before the file was
+        moved into place -- so it could claim success for a transfer that then
+        failed.
+        """
+        row = self._progress_rows.get(info.get("name", ""))
+        if row is None:
+            return
+        ok = info.get("status") == "ok"
+        row.set_done(ok, "Saved" if ok else "Failed")
+
     def _enter_manual(self) -> None:
         dlg = ManualTargetDialog(int(self.controller.config["port"]), self)
         if dlg.exec():
@@ -262,7 +336,26 @@ class DashboardPage(QWidget):
             peer = Peer(name=dlg.host, ip=dlg.host, port=dlg.port, fingerprint="")
             self.send_requested.emit(peer)
 
-    def refresh_device_info(self) -> None:
+    def on_show(self) -> None:
+        """Re-read everything that can change while the app is open.
+
+        The address in particular used to be computed once in the constructor,
+        so it went stale as soon as the machine changed network.
+        """
         self.controller.reload_config()
         self.name_label.setText(self.controller.config["device_name"])
         self.fpr_label.setText(_fpr_short(self.controller.fingerprint))
+        self.secret_id_label.setText(cfg_mod.secret_fingerprint() or "not set")
+
+        self._primary_addr = primary_lan_address()
+        port = self.controller.config["port"]
+        self.addr_label.setText(
+            f"{self._primary_addr}  ·  port {port}" if self._primary_addr
+            else "no network address detected")
+        others = [f"{ip} ({role})" for ip, role in describe_addresses()
+                  if role != "primary" and "loopback" not in role]
+        self.other_addr_label.setText(
+            "other adapters: " + ", ".join(others) if others else "")
+
+    # Kept for callers that used the old name.
+    refresh_device_info = on_show

@@ -100,10 +100,19 @@ def _cmd_info(args: argparse.Namespace) -> int:
     print(f"  Discovery    : {'on' if cfg.get('discovery_enabled', True) else 'off'}"
           f" (udp {cfg['discovery_port']})")
     print(f"  Secret set   : {'yes' if cfg_mod.load_secret() else 'NO'}")
+    print(f"  Secret ID    : {cfg_mod.secret_fingerprint() or '(none)'}"
+          f"   <- must match on the other device")
     print(f"  Fingerprint  : {identity.fingerprint_pretty(fpr) if fpr else '(none yet)'}")
-    addrs = local_ipv4_addresses()
-    if addrs:
-        print(f"  Local IPv4   : {', '.join(addrs)}")
+    from .netutil import describe_addresses, describe_local_networks, primary_lan_address
+
+    primary = primary_lan_address()
+    if primary:
+        print(f"  Address      : {primary}   <- give this one to other devices")
+    others = [f"{ip} ({role})" for ip, role in describe_addresses()
+              if role != "primary"]
+    if others:
+        print(f"  Other adapters: {', '.join(others)}")
+    print(f"  Local networks: {describe_local_networks()}")
     return 0
 
 
@@ -124,6 +133,24 @@ def _cmd_config(args: argparse.Namespace) -> int:
         changed = True
     if args.discovery is not None:
         cfg["discovery_enabled"] = (args.discovery == "on")
+        changed = True
+    if args.trust_network:
+        import ipaddress
+
+        nets = list(cfg.get("extra_local_networks") or [])
+        for item in args.trust_network:
+            try:
+                net = str(ipaddress.ip_network(item, strict=False))
+            except ValueError:
+                print(f"Not a valid network: {item!r} (try 192.168.1.0/24)",
+                      file=sys.stderr)
+                return 1
+            if net not in nets:
+                nets.append(net)
+        cfg["extra_local_networks"] = nets
+        changed = True
+    if args.untrust_all_networks:
+        cfg["extra_local_networks"] = []
         changed = True
     if changed:
         cfg_mod.save_config(cfg)
@@ -285,6 +312,11 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--port", type=int, help=f"TCP port (default {DEFAULT_PORT})")
     pc.add_argument("--max-size", help="max accepted file size (e.g. 500M, 20G)")
     pc.add_argument("--discovery", choices=["on", "off"], help="enable LAN discovery")
+    pc.add_argument("--trust-network", action="append", metavar="CIDR",
+                    help="also treat this network as local, e.g. 192.168.1.0/24 "
+                         "(for a peer on a different subnet of the same LAN)")
+    pc.add_argument("--untrust-all-networks", action="store_true",
+                    help="forget every manually trusted network")
     pc.set_defaults(func=_cmd_config)
 
     pr = sub.add_parser("receive", aliases=["recv", "serve"],

@@ -7,7 +7,7 @@ import json
 import os
 import socket
 import struct
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def set_exclusive_bind(sock: socket.socket) -> None:
@@ -113,28 +113,82 @@ def describe_local_networks() -> str:
     return "; ".join(parts) or "no local networks detected"
 
 
+def primary_lan_address() -> Optional[str]:
+    """The address other devices should use to reach this machine.
+
+    Found by asking the kernel which local address it would use to reach the
+    outside world. ``connect()`` on a UDP socket only sets the peer for the
+    routing table lookup -- no packet is sent and nothing is contacted.
+
+    This is the single answer to "which IP do I type on the other computer?",
+    a question the app previously answered with an unordered list of every
+    address including VirtualBox and WSL adapters.
+    """
+    for target in ("8.8.8.8", "1.1.1.1"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect((target, 9))
+                addr = s.getsockname()[0]
+            finally:
+                s.close()
+        except OSError:
+            continue
+        if addr and addr != "0.0.0.0" and not addr.startswith("127."):
+            return addr
+    return None
+
+
 def local_ipv4_addresses() -> List[str]:
-    """Best-effort list of this host's own IPv4 addresses (for display)."""
+    """This host's own IPv4 addresses, primary first, then the rest sorted."""
     addrs: set[str] = set()
     try:
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
             addrs.add(info[4][0])
-    except socket.gaierror:
+    except (socket.gaierror, UnicodeError):
         pass
-    # The "connect a UDP socket to a public IP" trick reveals the primary
-    # outbound interface address without sending anything.
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(("192.168.255.255", 9))
-            addrs.add(s.getsockname()[0])
-        finally:
-            s.close()
-    except OSError:
-        pass
+    primary = primary_lan_address()
+    if primary:
+        addrs.add(primary)
     addrs.discard("0.0.0.0")
-    return sorted(a for a in addrs if a)
+    rest = sorted(a for a in addrs if a and a != primary)
+    return ([primary] if primary else []) + rest
+
+
+# Ranges belonging to hypervisors and container runtimes. Only used to explain
+# a secondary address to the user -- never to make a security decision.
+_VIRTUAL_HINTS = (
+    (ipaddress.ip_network("192.168.56.0/24"), "VirtualBox"),
+    (ipaddress.ip_network("192.168.99.0/24"), "Docker Machine"),
+    (ipaddress.ip_network("172.17.0.0/16"), "Docker/WSL"),
+    (ipaddress.ip_network("172.18.0.0/16"), "Docker"),
+)
+
+
+def describe_addresses() -> List[Tuple[str, str]]:
+    """Each local address paired with a short role label, primary first."""
+    primary = primary_lan_address()
+    out: List[Tuple[str, str]] = []
+    for addr in local_ipv4_addresses():
+        try:
+            parsed = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if addr == primary:
+            label = "primary"
+        elif parsed.is_loopback:
+            label = "loopback"
+        elif parsed.is_link_local:
+            label = "link-local (no network)"
+        else:
+            label = "other adapter"
+            for net, name in _VIRTUAL_HINTS:
+                if parsed in net:
+                    label = f"{name} (virtual)"
+                    break
+        out.append((addr, label))
+    return out
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
