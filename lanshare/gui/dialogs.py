@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QLineEdit, QSpinBox, QVBoxLayout, QWidget,
 )
@@ -34,7 +34,8 @@ class _BaseDialog(QDialog):
 class IncomingRequestDialog(_BaseDialog):
     """Asks the user to accept or decline one incoming file transfer."""
 
-    def __init__(self, info: Dict[str, Any], parent: Optional[QWidget] = None):
+    def __init__(self, info: Dict[str, Any], parent: Optional[QWidget] = None,
+                 timeout_seconds: int = 120):
         super().__init__("Incoming file", parent)
         self.accepted_choice = False
 
@@ -74,6 +75,9 @@ class IncomingRequestDialog(_BaseDialog):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
+        self._countdown_label = label("", "muted")
+        btn_row.addWidget(self._countdown_label)
+        btn_row.addWidget(h_spacer())
         decline_btn = button("Decline", cls="secondary", icon_name="x")
         accept_btn = button("Accept", cls="primary", icon_name="check",
                             icon_color=PALETTE.text_on_accent)
@@ -83,14 +87,35 @@ class IncomingRequestDialog(_BaseDialog):
         btn_row.addWidget(accept_btn)
         self.body().addLayout(btn_row)
 
-        accept_btn.setDefault(True)
-        accept_btn.setAutoDefault(True)
+        # Decline by ourselves before the waiting transfer thread gives up, so
+        # the dialog can never linger over an offer that has already timed out
+        # (clicking Accept then would appear to work but deliver nothing).
+        self._remaining = int(timeout_seconds)
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+        self._tick()
+        self._timer.start()
+
+        decline_btn.setDefault(True)
+        decline_btn.setAutoDefault(True)
+
+    def _tick(self) -> None:
+        if self._remaining <= 0:
+            self._countdown_label.setText("expired")
+            self._timer.stop()
+            self._decline()
+            return
+        self._countdown_label.setText(f"auto-declines in {self._remaining}s")
+        self._remaining -= 1
 
     def _accept(self) -> None:
+        self._timer.stop()
         self.accepted_choice = True
         self.accept()
 
     def _decline(self) -> None:
+        self._timer.stop()
         self.accepted_choice = False
         self.reject()
 

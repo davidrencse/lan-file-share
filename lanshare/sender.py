@@ -4,6 +4,7 @@ that the remote user approves."""
 from __future__ import annotations
 
 import hashlib
+import hmac
 import socket
 import ssl
 import sys
@@ -17,6 +18,7 @@ from . import config as cfg_mod
 from . import identity
 from .auth import AuthError, client_authenticate
 from .netutil import ProtocolError, is_lan_address, recv_msg, send_msg
+from .safety import sanitize_display_text
 from .tlsctx import client_context
 
 _CONNECT_TIMEOUT = 15.0
@@ -84,7 +86,8 @@ def send_files(host: str, port: int, files: Sequence[str], *,
                progress_cb: Optional[ProgressFn] = None,
                log_cb: Optional[LogFn] = None,
                tofu_confirm_cb: Optional[TofuConfirmFn] = None,
-               cancel_event: Optional[threading.Event] = None) -> List[Dict[str, Any]]:
+               cancel_event: Optional[threading.Event] = None,
+               expect_fingerprint: Optional[str] = None) -> List[Dict[str, Any]]:
     """Send one or more files to a receiver. Returns a per-file result list."""
 
     def log(msg: str) -> None:
@@ -127,6 +130,18 @@ def send_files(host: str, port: int, files: Sequence[str], *,
         tls = ctx.wrap_socket(raw, server_hostname=None)
         server_fpr = _server_fingerprint(tls)
 
+        # When we already know which certificate to expect (discovery replies
+        # are authenticated and carry the peer's fingerprint), verify it before
+        # authenticating. The auth step necessarily reveals an HMAC computed
+        # with the shared secret, so refusing here means a device that lured us
+        # into connecting never gets material it could attack offline.
+        if expect_fingerprint and not hmac.compare_digest(
+                server_fpr.lower(), expect_fingerprint.strip().lower()):
+            raise SendError(
+                "receiver's TLS identity does not match the one it advertised "
+                "over discovery -- aborting before authenticating"
+            )
+
         client_authenticate(tls, secret, server_fpr)
 
         send_msg(tls, {"type": "hello", "device_name": device_name,
@@ -134,7 +149,7 @@ def send_files(host: str, port: int, files: Sequence[str], *,
         hello = recv_msg(tls)
         if hello.get("type") != "hello":
             raise SendError("unexpected reply to hello")
-        peer_name = str(hello.get("device_name", "unknown"))[:64]
+        peer_name = sanitize_display_text(hello.get("device_name", "unknown"))
 
         _check_tofu(peer_name, server_fpr, interactive=interactive, log=log,
                    tofu_confirm_cb=tofu_confirm_cb)
@@ -205,12 +220,19 @@ def _send_one(tls: ssl.SSLSocket, path: Path, peer_name: str, show_progress: boo
     sent = 0
     start = time.monotonic()
     with open(path, "rb") as fh:
-        while True:
+        # Send exactly the number of bytes we declared in the offer. If the file
+        # changed underneath us since stat(), sending more would desynchronise
+        # the stream and sending fewer would hang the receiver until its
+        # timeout, so bail out loudly instead.
+        while sent < size:
             if cancel_event is not None and cancel_event.is_set():
                 raise Cancelled("cancelled by user")
-            chunk = fh.read(_CHUNK)
+            chunk = fh.read(min(_CHUNK, size - sent))
             if not chunk:
-                break
+                raise SendError(
+                    f"'{path.name}' shrank while it was being sent "
+                    f"({sent} of {size} bytes available); transfer aborted"
+                )
             tls.sendall(chunk)
             sent += len(chunk)
             if show_progress and size:
@@ -238,10 +260,15 @@ def _send_one(tls: ssl.SSLSocket, path: Path, peer_name: str, show_progress: boo
 
 def _console_progress(sent: int, total: int, start: float) -> None:
     pct = sent * 100 // total
-    elapsed = max(time.monotonic() - start, 1e-6)
-    rate = sent / elapsed / (1024 * 1024)
+    elapsed = time.monotonic() - start
     bar_len = 30
     filled = bar_len * sent // total
     bar = "#" * filled + "-" * (bar_len - filled)
-    sys.stdout.write(f"\r    [{bar}] {pct:3d}%  {rate:6.1f} MiB/s")
+    # Below ~150 ms the elapsed time is mostly noise and the derived rate is
+    # meaningless (it used to print things like "1907348.6 MiB/s").
+    if elapsed >= 0.15:
+        rate = sent / elapsed / (1024 * 1024)
+        sys.stdout.write(f"\r    [{bar}] {pct:3d}%  {rate:6.1f} MiB/s")
+    else:
+        sys.stdout.write(f"\r    [{bar}] {pct:3d}%")
     sys.stdout.flush()

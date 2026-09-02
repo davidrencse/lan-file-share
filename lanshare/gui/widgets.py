@@ -20,6 +20,12 @@ from .theme import PALETTE, badge_for_extension
 def label(text: str, cls: str = "body", parent: Optional[QWidget] = None) -> QLabel:
     lbl = QLabel(text, parent)
     lbl.setProperty("class", cls)
+    # QLabel defaults to Qt.AutoText, which sniffs the string and renders it as
+    # rich text if it looks like HTML. Peer-supplied device names and file names
+    # flow into these labels, so a remote device could otherwise style itself to
+    # look trusted, or hide text, inside the approval dialog. Everything here is
+    # data, never markup.
+    lbl.setTextFormat(Qt.PlainText)
     return lbl
 
 

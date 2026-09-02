@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import io
-from contextlib import redirect_stdout
+import os
+import subprocess
+import sys
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
@@ -25,15 +27,25 @@ class SelfTestThread(QThread):
     done = Signal(bool, str)
 
     def run(self) -> None:
-        from ...selftest import run_selftest
-
-        buf = io.StringIO()
+        # Run out-of-process. The self-test needs a throwaway config directory,
+        # which it selects through the LANSHARE_HOME environment variable --
+        # a process-wide setting. Doing that in-process would briefly (and, if
+        # anything went wrong, permanently) repoint this running GUI at the
+        # temporary directory, hiding the user's real settings and secret.
+        env = dict(os.environ)
+        env.pop("LANSHARE_HOME", None)
         try:
-            with redirect_stdout(buf):
-                code = run_selftest()
-            self.done.emit(code == 0, buf.getvalue())
+            proc = subprocess.run(
+                [sys.executable, "-m", "lanshare", "selftest"],
+                capture_output=True, text=True, timeout=120, env=env,
+                cwd=str(Path(__file__).resolve().parents[3]),
+            )
+            output = (proc.stdout or "") + (proc.stderr or "")
+            self.done.emit(proc.returncode == 0, output)
+        except subprocess.TimeoutExpired:
+            self.done.emit(False, "self-test timed out after 120s")
         except Exception as exc:  # noqa: BLE001
-            self.done.emit(False, f"{buf.getvalue()}\n{exc}")
+            self.done.emit(False, str(exc))
 
 
 class SettingsPage(QWidget):
@@ -105,7 +117,12 @@ class SettingsPage(QWidget):
 
         size_col = QVBoxLayout()
         size_col.addWidget(label("Max accepted file size", "secondary"))
-        self.max_size_edit = QLineEdit(human_size(int(cfg["max_file_bytes"])).replace(" ", ""))
+        # human_size() is lossy (rounds to one decimal). Remember both the exact
+        # byte count and the string we rendered, so simply re-saving an
+        # untouched form cannot quietly drift the stored value.
+        self._max_bytes_exact = int(cfg["max_file_bytes"])
+        self._max_size_shown = human_size(self._max_bytes_exact).replace(" ", "")
+        self.max_size_edit = QLineEdit(self._max_size_shown)
         size_col.addWidget(self.max_size_edit)
         row2.addLayout(size_col)
 
@@ -139,12 +156,21 @@ class SettingsPage(QWidget):
 
     def _save_general(self) -> None:
         name = self.name_edit.text().strip() or self.controller.config["device_name"]
-        try:
-            max_bytes = parse_size(self.max_size_edit.text())
-        except ValueError:
-            self.save_status.setText("Invalid max size (e.g. 500M, 20G).")
-            self.save_status.setProperty("class", "tag-danger")
-            return
+        typed = self.max_size_edit.text().strip()
+        if typed == self._max_size_shown:
+            max_bytes = self._max_bytes_exact   # untouched: keep it byte-exact
+        else:
+            try:
+                max_bytes = parse_size(typed)
+            except ValueError:
+                self.save_status.setProperty("class", "tag-danger")
+                self.save_status.setText("Invalid max size (e.g. 500M, 20G).")
+                self.save_status.style().unpolish(self.save_status)
+                self.save_status.style().polish(self.save_status)
+                return
+            self._max_bytes_exact = max_bytes
+            self._max_size_shown = human_size(max_bytes).replace(" ", "")
+            self.max_size_edit.setText(self._max_size_shown)
         self.controller.save_config({
             "device_name": name,
             "download_dir": self.dir_edit.text().strip(),
@@ -267,8 +293,9 @@ class SettingsPage(QWidget):
 
     def _set_secret(self) -> None:
         value = self.pair_edit.text().strip()
-        if len(value) < 8:
-            self._flash_security("Secret must be at least 8 characters.", danger=True)
+        problem = cfg_mod.check_secret_strength(value)
+        if problem:
+            self._flash_security(f"Secret rejected: {problem}.", danger=True)
             return
         cfg_mod.save_secret(value)
         self._activate_secret_field(value)

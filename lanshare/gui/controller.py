@@ -3,6 +3,7 @@ the background discovery poller."""
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Signal
@@ -96,9 +97,20 @@ class AppController(QObject):
     # -- lifecycle ------------------------------------------------------
 
     def shutdown(self) -> None:
-        if self.receiver_thread is not None:
-            self.receiver_thread.request_stop()
-            self.receiver_thread.wait(2000)
+        """Stop both background threads and actually wait for them.
+
+        Qt aborts the process if a QThread is still running when the
+        application object is destroyed, so these waits are not optional. Both
+        threads are built to notice the stop request quickly: the receiver
+        resolves any pending approval prompt first, and the poller is
+        interrupted out of its sleep.
+        """
         if self.discovery_poller is not None:
             self.discovery_poller.stop()
-            self.discovery_poller.wait(2000)
+        if self.receiver_thread is not None:
+            self.receiver_thread.request_stop()
+            if not self.receiver_thread.wait(8000):
+                print("warning: receiver thread did not stop in time",
+                      file=sys.stderr)
+        if self.discovery_poller is not None:
+            self.discovery_poller.wait(5000)

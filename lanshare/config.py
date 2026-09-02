@@ -58,6 +58,46 @@ def _harden_file(path: Path) -> None:
             pass
 
 
+def write_private_bytes(path: Path, data: bytes) -> None:
+    """Write *data* to *path* so it is owner-only from the very first byte.
+
+    ``Path.write_bytes`` would create the file using the process umask (often
+    world-readable) and only be tightened afterwards, leaving a window where
+    secret material is readable by other local users. Passing the mode to
+    ``os.open`` closes that window.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW  # never write through a planted symlink
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    _harden_file(path)  # no-op on POSIX, keeps intent explicit elsewhere
+
+
+MIN_SECRET_LEN = 12
+
+
+def check_secret_strength(secret: str) -> str | None:
+    """Return a human-readable problem with *secret*, or None if acceptable."""
+    if len(secret) < MIN_SECRET_LEN:
+        return (f"too short -- use at least {MIN_SECRET_LEN} characters "
+                f"(the generated secret is strongest)")
+    if len(set(secret)) < 5:
+        return "too repetitive to be guess-resistant"
+    lowered = secret.lower()
+    if lowered in {"password1234", "lanshare1234", "changemenow"}:
+        return "this is a well-known value; pick something unguessable"
+    return None
+
+
 def default_download_dir() -> Path:
     return Path.home() / "LANShare received"
 
@@ -76,19 +116,46 @@ def config_path() -> Path:
     return config_dir() / "config.json"
 
 
+def _coerce(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Force known keys to sane types so a hand-edited or corrupt config file
+    fails soft here instead of raising deep inside the transfer path."""
+    def as_port(value: Any, fallback: int) -> int:
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return port if 0 <= port <= 65535 else fallback
+
+    cfg["port"] = as_port(cfg.get("port"), DEFAULTS["port"])
+    cfg["discovery_port"] = as_port(
+        cfg.get("discovery_port"), DEFAULTS["discovery_port"])
+    try:
+        max_bytes = int(cfg.get("max_file_bytes"))
+        cfg["max_file_bytes"] = max_bytes if max_bytes >= 0 else DEFAULTS["max_file_bytes"]
+    except (TypeError, ValueError):
+        cfg["max_file_bytes"] = DEFAULTS["max_file_bytes"]
+    cfg["discovery_enabled"] = bool(cfg.get("discovery_enabled", True))
+    if not isinstance(cfg.get("device_name"), str) or not cfg["device_name"].strip():
+        cfg["device_name"] = DEFAULTS["device_name"]
+    cfg["device_name"] = cfg["device_name"].strip()[:64]
+    raw_dir = cfg.get("download_dir")
+    cfg["download_dir"] = raw_dir if isinstance(raw_dir, str) and raw_dir else None
+    return cfg
+
+
 def load_config() -> Dict[str, Any]:
     """Load settings, filling in defaults for anything missing."""
     cfg = dict(DEFAULTS)
     path = config_path()
     if path.exists():
         try:
-            cfg.update(json.loads(path.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, OSError):
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             # Corrupt config should not brick the tool; fall back to defaults.
             pass
-    if not cfg.get("device_name"):
-        cfg["device_name"] = DEFAULTS["device_name"]
-    return cfg
+    return _coerce(cfg)
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
@@ -126,7 +193,7 @@ def save_secret(secret: str | bytes) -> None:
         secret = secret.encode("utf-8")
     path = secret_path()
     tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(secret)
+    write_private_bytes(tmp, secret)
     os.replace(tmp, path)
     _harden_file(path)
 

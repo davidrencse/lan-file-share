@@ -10,6 +10,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 # Make the package importable when run standalone.
@@ -28,13 +29,18 @@ from lanshare.safety import UnsafeFileError  # noqa: E402
 def test_sanitize_strips_paths_and_traversal():
     assert safety.sanitize_filename("report.pdf") == "report.pdf"
     assert safety.sanitize_filename("/etc/passwd") == "passwd"
-    assert safety.sanitize_filename(r"C:\Windows\system32\evil.dll") == "evil.dll"
     assert safety.sanitize_filename("../../secret.txt") == "secret.txt"
     assert safety.sanitize_filename("a/b/c/deep.txt") == "deep.txt"
+    # A backslash is escaped rather than split on, so a Windows-looking path is
+    # flattened instead of reduced to its last component. Either way no
+    # separator survives -- and the behaviour is identical on both platforms.
+    out = safety.sanitize_filename(r"C:\Windows\system32\evil.dll")
+    assert "/" not in out and "\\" not in out
+    assert out.endswith("evil.dll"), out
 
 
 def test_sanitize_rejects_pure_traversal():
-    for bad in ["..", ".", "", "   ", "...", "/", "\\"]:
+    for bad in ["..", ".", "", "   ", "...", "/"]:
         try:
             safety.sanitize_filename(bad)
             assert False, f"expected rejection for {bad!r}"
@@ -64,14 +70,81 @@ def test_sanitize_length_cap():
 
 # --- destination safety ----------------------------------------------------
 
-def test_resolve_destination_contained_and_collision(tmp_path=None):
+def test_reserve_destination_contained_and_collision(tmp_path=None):
     d = Path(tempfile.mkdtemp(prefix="lanshare-dl-"))
-    p1 = safety.resolve_safe_destination(d, "file.txt")
+    p1 = safety.reserve_destination(d, "file.txt")
     assert p1.parent == d.resolve()
+    assert p1.exists(), "reservation must actually claim the name on disk"
     p1.write_bytes(b"x")
-    p2 = safety.resolve_safe_destination(d, "file.txt")
+    p2 = safety.reserve_destination(d, "file.txt")
     assert p2 != p1
     assert p2.name == "file (1).txt"
+
+
+def test_reserve_destination_is_atomic_under_concurrency():
+    """Two racing receivers must never be handed the same path."""
+    d = Path(tempfile.mkdtemp(prefix="lanshare-race-"))
+    handed_out = []
+    lock = threading.Lock()
+
+    def claim():
+        p = safety.reserve_destination(d, "same.bin")
+        with lock:
+            handed_out.append(p)
+
+    threads = [threading.Thread(target=claim) for _ in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(handed_out) == 12
+    assert len(set(handed_out)) == 12, "duplicate destination handed to two callers"
+
+
+def test_sanitize_strips_bidi_and_invisible_characters():
+    """U+202E makes 'gnp.exe' render as 'exe.png' - a spoofed approval prompt."""
+    out = safety.sanitize_filename("‮gnp.exe")
+    assert "‮" not in out
+    assert out == "gnp.exe"
+    for sneaky in ("​", "‎", "⁦", "﻿", "؜"):
+        assert sneaky not in safety.sanitize_filename(f"a{sneaky}b.txt")
+
+
+def test_sanitize_preserves_dotfiles_and_backslash_names():
+    # A leading dot is legal and meaningful; it must survive.
+    assert safety.sanitize_filename(".bashrc") == ".bashrc"
+    assert safety.sanitize_filename(".gitignore") == ".gitignore"
+    # A backslash is an ordinary character on POSIX, so the name must not be
+    # truncated at it -- and it must not act as a separator on Windows either.
+    # Same result on both platforms.
+    assert safety.sanitize_filename("back\\slash.txt") == "back_slash.txt"
+    # Traversal-looking names are still neutralised.
+    escaped = safety.sanitize_filename("..\\..\\evil.txt")
+    assert "\\" not in escaped and "/" not in escaped and escaped.endswith("evil.txt")
+    for bad in ("..", ".", "...", ""):
+        try:
+            safety.sanitize_filename(bad)
+            assert False, f"expected rejection for {bad!r}"
+        except UnsafeFileError:
+            pass
+
+
+def test_sanitize_display_text_neutralises_markup_and_controls():
+    out = safety.sanitize_display_text("<b>trusted</b>‮foo\x00")
+    assert "‮" not in out and "\x00" not in out
+    # Markup is *kept as literal text* - the GUI renders plain text - but it
+    # must never contain characters that reorder or hide what follows.
+    assert "<b>" in out
+
+
+def test_parse_size_rejects_negative_and_junk():
+    assert safety.parse_size("10GiB") == 10 * 1024 ** 3
+    for bad in ("-5G", "abc", ""):
+        try:
+            safety.parse_size(bad)
+            assert False, f"expected ValueError for {bad!r}"
+        except ValueError:
+            pass
 
 
 def test_validate_size():
@@ -260,6 +333,166 @@ def test_round_trip_wrong_secret_fails():
         secret_recv="correct-secret", secret_send="wrong-secret")
     assert err is not None  # sender should see an auth failure
     assert not any(dl.iterdir())
+
+
+# --- discovery must be authenticated ---------------------------------------
+
+def test_discovery_ignores_unauthenticated_queries():
+    """A device without the shared secret must learn nothing - not even that
+    we exist. No reply at all (also removes the reflection amplifier)."""
+    from lanshare.discovery import DiscoveryResponder
+
+    responder = DiscoveryResponder("SecretiveBox", 51888, 0,
+                                   "ab" * 32, b"the-real-secret")
+    # Hand-rolled query with no MAC, and one with a wrong MAC.
+    import base64
+    import json as _json
+    no_mac = _json.dumps({"magic": "lanshare-discovery-v2", "kind": "query",
+                          "nonce": base64.b64encode(b"x" * 16).decode()}).encode()
+    bad_mac = _json.dumps({"magic": "lanshare-discovery-v2", "kind": "query",
+                           "nonce": base64.b64encode(b"x" * 16).decode(),
+                           "mac": base64.b64encode(b"y" * 32).decode()}).encode()
+    assert responder._build_reply(no_mac) is None
+    assert responder._build_reply(bad_mac) is None
+    assert responder._build_reply(b"not even json") is None
+    # And with the right secret it does answer.
+    from lanshare.discovery import _b64, _mac
+    nonce = b"z" * 16
+    good = _json.dumps({"magic": "lanshare-discovery-v2", "kind": "query",
+                        "nonce": _b64(nonce),
+                        "mac": _b64(_mac(b"the-real-secret", "query", nonce))}).encode()
+    reply = responder._build_reply(good)
+    assert reply is not None and b"SecretiveBox" in reply
+
+
+def test_discovery_rejects_forged_replies():
+    """A forged/replayed reply must not appear as a peer (lure prevention)."""
+    from lanshare.discovery import _b64, _mac, _parse_reply
+    import json as _json
+
+    secret = b"shared-secret-value"
+    nonce = b"n" * 16
+    # Reply MAC'd with the wrong secret -> rejected.
+    forged = _json.dumps({
+        "magic": "lanshare-discovery-v2", "kind": "reply", "name": "Impostor",
+        "port": 51888, "fpr": "cd" * 32,
+        "mac": _b64(_mac(b"attacker-secret", "reply", nonce, "Impostor", 51888, "cd" * 32)),
+    }).encode()
+    assert _parse_reply(forged, ("192.168.1.9", 51889), secret, nonce) is None
+    # Correctly MAC'd but bound to a *different* nonce -> rejected (replay).
+    other = b"m" * 16
+    replayed = _json.dumps({
+        "magic": "lanshare-discovery-v2", "kind": "reply", "name": "Real",
+        "port": 51888, "fpr": "ab" * 32,
+        "mac": _b64(_mac(secret, "reply", other, "Real", 51888, "ab" * 32)),
+    }).encode()
+    assert _parse_reply(replayed, ("192.168.1.9", 51889), secret, nonce) is None
+    # Genuine reply for our nonce -> accepted.
+    good = _json.dumps({
+        "magic": "lanshare-discovery-v2", "kind": "reply", "name": "Real",
+        "port": 51888, "fpr": "ab" * 32,
+        "mac": _b64(_mac(secret, "reply", nonce, "Real", 51888, "ab" * 32)),
+    }).encode()
+    peer = _parse_reply(good, ("192.168.1.9", 51889), secret, nonce)
+    assert peer is not None and peer.name == "Real" and peer.port == 51888
+
+
+# --- the self-test must not leak its throwaway config dir -------------------
+
+def test_selftest_restores_lanshare_home():
+    from lanshare import config as cfg_mod
+    from lanshare.selftest import run_selftest
+
+    before = os.environ.get("LANSHARE_HOME")
+    cfg_mod.save_secret("a-real-user-secret-value")
+    import contextlib
+    import io as _io
+    with contextlib.redirect_stdout(_io.StringIO()):
+        rc = run_selftest()
+    assert rc == 0
+    assert os.environ.get("LANSHARE_HOME") == before, "self-test leaked its temp home"
+    assert cfg_mod.load_secret() == b"a-real-user-secret-value", \
+        "self-test clobbered the real secret"
+
+
+def test_selftest_secret_is_not_a_fixed_constant():
+    """A hardcoded secret in shipped source would be an auth bypass."""
+    import inspect
+
+    from lanshare import selftest as st
+    src = inspect.getsource(st)
+    assert "selftest-shared-secret" not in src
+    assert "token_urlsafe" in src or "token_hex" in src
+
+
+# --- one rude peer must not starve the receiver -----------------------------
+
+def test_idle_connection_does_not_block_other_transfers():
+    """An unauthenticated peer that connects and goes silent used to hold the
+    single-threaded accept loop hostage for the full control timeout."""
+    from lanshare import config as cfg_mod
+    from lanshare import identity
+    from lanshare.receiver import Receiver
+    from lanshare.sender import send_files
+    from lanshare.tlsctx import server_context
+
+    secret = "starvation-test-secret"
+    workdir = Path(tempfile.mkdtemp(prefix="lanshare-starve-"))
+    dl = workdir / "dl"
+    dl.mkdir()
+    cfg_mod.save_secret(secret)
+    cfg = cfg_mod.load_config()
+    cfg["device_name"] = "starve-receiver"
+    cfg["download_dir"] = str(dl)
+    cfg["discovery_enabled"] = False
+    cfg_mod.save_config(cfg)
+    identity.ensure_identity(cfg["device_name"])
+
+    receiver = Receiver(cfg, approval=lambda info: True, bind_host="127.0.0.1")
+    ready = threading.Event()
+    port_box = {}
+
+    def serve():
+        kp, cp = identity.ensure_identity(receiver.device_name)
+        fpr = identity.own_fingerprint() or ""
+        ctx = server_context(cp, kp)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(16)
+        listener.settimeout(0.5)
+        port_box["port"] = listener.getsockname()[1]
+        ready.set()
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline and not receiver._stop_flag.is_set():
+            try:
+                s, a = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            receiver._dispatch(ctx, s, a, fpr)
+        listener.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    assert ready.wait(10)
+    port = port_box["port"]
+
+    # A rude peer: TCP connected, never completes the TLS handshake.
+    rude = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        src = workdir / "payload.txt"
+        src.write_bytes(b"legitimate traffic")
+        started = time.monotonic()
+        results = send_files("127.0.0.1", port, [str(src)], secret=secret.encode(),
+                             device_name="legit", interactive=False,
+                             show_progress=False)
+        elapsed = time.monotonic() - started
+        assert results and results[0]["sent"], "legitimate transfer was blocked"
+        assert elapsed < 15, f"transfer took {elapsed:.1f}s - looks serialized"
+    finally:
+        rude.close()
+        receiver.stop()
 
 
 def _main():

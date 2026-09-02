@@ -8,6 +8,7 @@ temporary, throwaway config directory so it never touches real settings.
 from __future__ import annotations
 
 import os
+import secrets
 import socket
 import tempfile
 import threading
@@ -41,6 +42,23 @@ def _serve_one_connection(receiver, ready_evt, errbox) -> None:
 
 
 def run_selftest() -> int:
+    """Run a throwaway loopback transfer. Returns 0 on success.
+
+    The temporary config directory is applied by swapping ``LANSHARE_HOME`` and
+    is always restored before returning -- leaking it would silently repoint the
+    whole process (notably a long-lived GUI) at the throwaway directory.
+    """
+    previous_home = os.environ.get("LANSHARE_HOME")
+    try:
+        return _run_selftest_inner()
+    finally:
+        if previous_home is None:
+            os.environ.pop("LANSHARE_HOME", None)
+        else:
+            os.environ["LANSHARE_HOME"] = previous_home
+
+
+def _run_selftest_inner() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="lanshare-selftest-"))
     os.environ["LANSHARE_HOME"] = str(tmp / "cfg")
     download_dir = tmp / "downloads"
@@ -52,7 +70,10 @@ def run_selftest() -> int:
     from .receiver import Receiver
     from .sender import send_files
 
-    secret = "selftest-shared-secret"
+    # Random, never a fixed constant: a hardcoded value published in the source
+    # would be an authentication bypass for anyone who read it, should this
+    # config directory ever be used for real.
+    secret = secrets.token_urlsafe(24)
     cfg_mod.save_secret(secret)
     cfg = cfg_mod.load_config()
     cfg["device_name"] = "selftest-receiver"

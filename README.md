@@ -37,11 +37,17 @@ Every transfer is:
 - **Authenticated** in both directions with a shared secret via an HMAC challenge-response
   bound to the TLS certificate fingerprint (channel binding), so a man-in-the-middle can't
   relay a session.
-- **Approved by a human** on the receiving device before a single byte is written.
+- **Approved by a human** on the receiving device before a single byte is written — shown with
+  the true file name, stripped of invisible and text-direction characters that could otherwise
+  make an executable *look* like an image.
 - **Restricted to the local network** — connections from routable/public IP addresses are refused.
 - **Written safely** — file names are sanitized, sizes are checked against a limit and against
-  free disk space, and files can only ever land inside the configured download directory
-  (no path traversal, no silent overwrites).
+  free disk space, and the destination is claimed atomically inside the configured download
+  directory (no path traversal, no overwrites, no races between concurrent transfers).
+
+Device discovery is authenticated too: a device only answers a discovery query that proves
+knowledge of the shared secret, so LANShare doesn't announce your hostname or certificate
+fingerprint to everyone on the network.
 
 See [Security model in depth](#security-model-in-depth) below for the full threat model and honest limitations.
 
@@ -143,10 +149,13 @@ B is prompted to accept or decline each file before anything is written to disk.
     sudo ufw allow from 192.168.0.0/16 to any port 51888 proto tcp
     sudo ufw allow from 192.168.0.0/16 to any port 51889 proto udp
     ```
-- **Discovery** relies on UDP broadcast, which some networks (guest Wi-Fi, client isolation,
-  most corporate VLANs) block. If nothing shows up, send/connect by IP directly — that always
-  works as long as the two machines can reach each other. Find a device's IP under its
-  Dashboard, or with `lanshare info`.
+- **Discovery** relies on UDP broadcast, sent out of every local interface (machines with
+  VirtualBox, WSL, Docker or VPN adapters have several, and querying only the default route
+  finds nothing or advertises an address the other side can't reach). Both devices must already
+  share the same secret, since queries are authenticated.
+  Some networks (guest Wi-Fi, client isolation, most corporate VLANs) block broadcast entirely.
+  If nothing shows up, send/connect by IP directly — that always works as long as the two
+  machines can reach each other. Find a device's IP under its Dashboard, or with `lanshare info`.
 
 ## Where things are stored
 
@@ -172,30 +181,48 @@ What LANShare provides:
    fingerprint, so an attacker who intercepts the connection (and therefore presents a
    *different* certificate) cannot produce a valid exchange even though they don't know the
    secret. This is the same channel-binding idea used by SCRAM.
-3. **Trust on first use (TOFU)** — the sender remembers each receiver's certificate fingerprint
-   and warns loudly if a known device name later shows a different fingerprint (possible
-   impersonation, or a legitimate reinstall).
-4. **Explicit consent** — nothing is written without the receiving user saying yes (outside
-   `--yes` test mode).
-5. **Network scoping** — the receiver refuses connections whose source address isn't
+3. **Authenticated discovery** — a query must carry an HMAC over the shared secret before it
+   gets any answer, so the service does not disclose its hostname, port and fingerprint to
+   unauthenticated devices, cannot be used as a reflection amplifier, and cannot be
+   impersonated by a forged reply. When you send to a device found this way, its TLS
+   certificate is checked against the advertised fingerprint *before* authenticating.
+4. **Trust on first use (TOFU)** — the sender pins each receiver's certificate fingerprint and
+   warns if a known device name later presents a different one. Be aware of what this does and
+   does not buy you: the device name is self-reported, so a determined attacker who already has
+   your shared secret can simply claim a name you have never seen and be trusted on first use.
+   TOFU here reliably catches accidental key changes (a reinstall) rather than a deliberate
+   impersonator.
+5. **Explicit consent** — nothing is written without the receiving user saying yes (outside
+   `--yes` test mode). The prompt shows the sanitized name that will actually be written.
+6. **Network scoping** — the receiver refuses connections whose source address isn't
    loopback/link-local/RFC1918-private, and the sender refuses to connect to non-LAN addresses.
-6. **Safe file handling** — untrusted file names are reduced to a sanitized base name (no
-   directories, no `..`, no control characters, no Windows reserved device names,
-   length-capped); the destination is verified to be inside the download directory; existing
-   files are never overwritten (`name (1).ext`); declared sizes are checked against a
+7. **Abuse resistance** — connections are handled concurrently (one silent peer cannot starve
+   the receiver), bounded to a fixed number of slots, and repeated authentication failures from
+   an address earn a cooldown.
+8. **Safe file handling** — untrusted file names are reduced to a sanitized base name (no
+   directories, no `..`, no control characters, no bidirectional/zero-width characters, no
+   Windows reserved device names, length-capped); the destination is verified to resolve inside
+   the download directory and is claimed atomically with `O_EXCL`, so existing files are never
+   overwritten (`name (1).ext`) even under concurrency; declared sizes are checked against a
    configurable ceiling and free disk space; incoming bytes are written to a temp file and
    atomically renamed only after the hash checks out.
 
 Honest limitations (it's "reasonably secure", not a hardened product):
 
-- The shared secret and TLS private key are stored on disk. On POSIX they're written `0600`
-  in a `0700` directory; on Windows they rely on your user profile's ACL.
+- The shared secret and TLS private key are stored on disk. On POSIX they're created `0600`
+  from the first byte inside a `0700` directory; on Windows they rely on your user profile's ACL.
 - Certificates are self-signed; identity trust is TOFU + the shared secret, not a CA. A
   brand-new device is trusted the first time you talk to it.
 - Anyone who knows your shared secret can *offer* you files (you still approve each one) and,
   if they also run a receiver, receive from you. Rotate the secret if it leaks.
-- There's no rate limiting / brute-force lockout; it's built for a home/office LAN, not a
-  hostile public network.
+- **This is not a PAKE.** Authenticating necessarily reveals an HMAC computed with the shared
+  secret, so anyone who can get you to connect to them can attack that transcript *offline*.
+  With the generated secret (~128 bits) that is hopeless for them; with a short human-chosen
+  one it is not. Prefer the generated value — `set-secret` requires at least 12 characters, but
+  length alone is not strength.
+- Failed authentication is rate-limited per address, which blunts online guessing, but there is
+  no account lockout or audit trail. It's built for a home/office LAN, not a hostile network.
+- IPv4 only. On an IPv6-only network it will not find or reach peers.
 
 ## Development
 

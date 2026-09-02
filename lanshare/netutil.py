@@ -4,9 +4,29 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import socket
 import struct
 from typing import Any, Dict, List
+
+
+def set_exclusive_bind(sock: socket.socket) -> None:
+    """Make a listening socket's port un-stealable by other local processes.
+
+    On Windows ``SO_REUSEADDR`` does *not* mean what it means on POSIX: it lets
+    any other process -- including one running as a different user -- bind a
+    port that is already in use and hijack the traffic. ``SO_EXCLUSIVEADDRUSE``
+    is the correct flag there. On POSIX ``SO_REUSEADDR`` is safe and is what
+    allows an immediate rebind after restart, so keep it.
+    """
+    if os.name == "nt":
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            return
+        except (AttributeError, OSError):
+            pass  # fall through; better to bind than to fail outright
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 # 4-byte big-endian length prefix; hard cap keeps a malicious peer from asking
 # us to buffer an enormous "control" message. File *content* is streamed

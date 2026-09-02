@@ -43,10 +43,17 @@ class ReceiverThread(QThread):
     file_saved = Signal(str)
     error = Signal(str)
 
+    # Slightly longer than the dialog's own countdown so the dialog always
+    # decides first and the two can never disagree about the outcome.
+    APPROVAL_TIMEOUT = 120
+    _APPROVAL_GRACE = 15
+
     def __init__(self, config: Dict[str, Any], parent=None):
         super().__init__(parent)
         self.config = config
         self._receiver = None
+        self._pending: set = set()
+        self._pending_lock = threading.Lock()
 
     def run(self) -> None:
         from ..receiver import Receiver
@@ -71,11 +78,24 @@ class ReceiverThread(QThread):
 
     def _approval(self, info: Dict[str, Any]) -> bool:
         responder = Responder()
-        self.incoming_request.emit(info, responder)
-        result = responder.wait(timeout=300)  # auto-decline if ignored for 5 min
+        with self._pending_lock:
+            self._pending.add(responder)
+        try:
+            self.incoming_request.emit(info, responder)
+            result = responder.wait(
+                timeout=self.APPROVAL_TIMEOUT + self._APPROVAL_GRACE)
+        finally:
+            with self._pending_lock:
+                self._pending.discard(responder)
         return bool(result)
 
     def request_stop(self) -> None:
+        # Release anything blocked on a prompt first, otherwise the transfer
+        # thread would sit in responder.wait() and outlive the application.
+        with self._pending_lock:
+            pending = list(self._pending)
+        for responder in pending:
+            responder.resolve(False)
         if self._receiver is not None:
             self._receiver.stop()
 
@@ -93,13 +113,18 @@ class DiscoveryPoller(QThread):
         self._wake = threading.Event()
 
     def run(self) -> None:
+        from .. import config as cfg_mod
         from ..discovery import discover
 
         while not self._stop.is_set():
             try:
-                peers = discover(self.discovery_port, timeout=1.5)
+                # Re-read each round so re-pairing takes effect without a restart.
+                peers = discover(self.discovery_port, cfg_mod.load_secret(),
+                                 timeout=1.5)
             except OSError:
                 peers = []
+            if self._stop.is_set():
+                break
             self.peers_found.emit(peers)
             self._wake.wait(self.interval)
             self._wake.clear()
@@ -121,11 +146,13 @@ class SendThread(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, host: str, port: int, files: List[str], parent=None):
+    def __init__(self, host: str, port: int, files: List[str], parent=None,
+                 expect_fingerprint: Optional[str] = None):
         super().__init__(parent)
         self.host = host
         self.port = port
         self.files = files
+        self.expect_fingerprint = expect_fingerprint
         self.cancel_event = threading.Event()
 
     def run(self) -> None:
@@ -141,6 +168,7 @@ class SendThread(QThread):
                 log_cb=lambda msg: self.log.emit(msg),
                 tofu_confirm_cb=self._tofu_confirm,
                 cancel_event=self.cancel_event,
+                expect_fingerprint=self.expect_fingerprint,
             )
             self.finished_ok.emit(results)
         except SendError as exc:

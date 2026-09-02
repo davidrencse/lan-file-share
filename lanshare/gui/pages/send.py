@@ -356,7 +356,8 @@ class SendPage(QWidget):
             self._progress_rows[path.name] = pr
             self.sending_rows_layout.insertWidget(self.sending_rows_layout.count() - 1, pr)
 
-        thread = SendThread(target.ip, target.port, [str(p) for p in self.selected_files], self)
+        thread = SendThread(target.ip, target.port, [str(p) for p in self.selected_files], self,
+                            expect_fingerprint=getattr(target, "fingerprint", "") or None)
         thread.progress.connect(self._on_send_progress)
         thread.log.connect(self._on_send_log)
         thread.tofu_conflict.connect(self._on_tofu_conflict)

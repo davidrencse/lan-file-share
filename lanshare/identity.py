@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
-import os
-import stat
 from pathlib import Path
 from typing import Tuple
 
@@ -64,13 +62,10 @@ def _generate(device_name: str, key_path: Path, cert_path: Path) -> None:
     )
     cert_bytes = cert.public_bytes(serialization.Encoding.PEM)
 
-    # Write the key with owner-only perms *before* the bytes land, where we can.
-    key_path.write_bytes(key_bytes)
-    if os.name != "nt":
-        try:
-            os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
-        except OSError:
-            pass
+    # The private key is created with 0600 already applied by os.open, so it is
+    # never momentarily world-readable. The certificate is public, so a plain
+    # write is fine.
+    config.write_private_bytes(key_path, key_bytes)
     cert_path.write_bytes(cert_bytes)
 
 
@@ -84,11 +79,30 @@ def fingerprint_pretty(hex_fpr: str) -> str:
     return ":".join(hex_fpr[i : i + 2] for i in range(0, len(hex_fpr), 2))
 
 
+_FPR_CACHE: dict = {}
+
+
 def own_fingerprint() -> str | None:
-    """SHA-256 fingerprint of this device's own certificate, if generated."""
+    """SHA-256 fingerprint of this device's own certificate, if generated.
+
+    Cached on (path, mtime, size) -- the GUI asks for this on every discovery
+    poll and re-parsing the certificate each time is pure waste.
+    """
     _key_path, cert_path = _paths()
-    if not cert_path.exists():
+    try:
+        st = cert_path.stat()
+    except OSError:
         return None
-    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    key = (str(cert_path), st.st_mtime_ns, st.st_size)
+    cached = _FPR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    except (ValueError, OSError):
+        return None
     der = cert.public_bytes(serialization.Encoding.DER)
-    return fingerprint_from_der(der)
+    fpr = fingerprint_from_der(der)
+    _FPR_CACHE.clear()  # only ever one identity per config dir
+    _FPR_CACHE[key] = fpr
+    return fpr

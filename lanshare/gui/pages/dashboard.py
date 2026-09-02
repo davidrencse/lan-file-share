@@ -3,6 +3,7 @@ peers on the network."""
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -154,7 +155,7 @@ class DashboardPage(QWidget):
 
         self.progress_container = QVBoxLayout()
         card.addLayout(self.progress_container)
-        self._progress_row: Optional[ProgressRow] = None
+        self._progress_rows: "OrderedDict[str, ProgressRow]" = OrderedDict()
 
         return card
 
@@ -217,15 +218,25 @@ class DashboardPage(QWidget):
         self.receiving_sub.setText(f"Could not start receiving: {msg}")
 
     def _on_progress(self, filename: str, received: int, total: int) -> None:
-        if self._progress_row is None or self._progress_row.name_label.text() != filename:
-            if self._progress_row is not None:
-                self._progress_row.setParent(None)
-            self._progress_row = ProgressRow(filename, total)
-            self.progress_container.addWidget(self._progress_row)
-        self._progress_row.set_phase("Receiving...")
-        self._progress_row.set_progress(received, total)
+        # Keyed per file: the receiver can now serve several transfers at once,
+        # and a single shared row would flicker between them.
+        row = self._progress_rows.get(filename)
+        if row is None:
+            row = ProgressRow(filename, total)
+            self._progress_rows[filename] = row
+            self.progress_container.addWidget(row)
+            self._trim_progress_rows()
+        row.set_phase("Receiving...")
+        row.set_progress(received, total)
         if received >= total:
-            self._progress_row.set_done(True, "Saved")
+            row.set_done(True, "Saved")
+
+    def _trim_progress_rows(self, keep: int = 4) -> None:
+        """Drop the oldest finished rows so the card cannot grow without bound."""
+        while len(self._progress_rows) > keep:
+            oldest_name = next(iter(self._progress_rows))
+            widget = self._progress_rows.pop(oldest_name)
+            widget.setParent(None)
 
     def _on_peers(self, peers) -> None:
         while self.peers_col.count():

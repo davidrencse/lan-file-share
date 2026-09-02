@@ -50,11 +50,10 @@ def _cmd_set_secret(args: argparse.Namespace) -> int:
         if secret != confirm:
             print("Secrets did not match.", file=sys.stderr)
             return 1
-    if not secret:
-        print("Empty secret rejected.", file=sys.stderr)
-        return 1
-    if len(secret) < 8:
-        print("Refusing a secret shorter than 8 characters.", file=sys.stderr)
+    problem = cfg_mod.check_secret_strength(secret)
+    if problem:
+        print(f"Secret rejected: {problem}.", file=sys.stderr)
+        print("Tip: 'lanshare init' generates a strong one for you.", file=sys.stderr)
         return 1
     cfg_mod.save_secret(secret)
     print("Shared secret saved.")
@@ -152,11 +151,15 @@ def _cmd_receive(args: argparse.Namespace) -> int:
 
 
 def _resolve_target(target: str, discovery_port: int):
-    """Resolve a discovered device name to its (ip, port) via LAN discovery."""
+    """Resolve a discovered device name to a Peer via LAN discovery."""
     from .discovery import discover
 
+    secret = cfg_mod.load_secret()
+    if not secret:
+        raise SystemExit("No shared secret set, so discovery cannot be "
+                         "authenticated. Run 'lanshare init' first.")
     print(f"  Looking for device '{target}' on the network...")
-    peers = discover(discovery_port, timeout=3.0)
+    peers = discover(discovery_port, secret, timeout=3.0)
     matches = [p for p in peers if p.name.lower() == target.lower()]
     if not matches:
         names = ", ".join(sorted(p.name for p in peers)) or "(none found)"
@@ -166,7 +169,7 @@ def _resolve_target(target: str, discovery_port: int):
         raise SystemExit(f"Multiple devices named '{target}': {detail}. Use an IP.")
     peer = matches[0]
     print(f"  Found '{peer.name}' at {peer.ip}:{peer.port}")
-    return peer.ip, peer.port
+    return peer
 
 
 def _cmd_send(args: argparse.Namespace) -> int:
@@ -175,14 +178,21 @@ def _cmd_send(args: argparse.Namespace) -> int:
     cfg = cfg_mod.load_config()
     host = args.target
     port = args.port or int(cfg["port"])
+    expect_fpr = None
     if args.find:
-        host, found_port = _resolve_target(args.target, int(cfg["discovery_port"]))
+        peer = _resolve_target(args.target, int(cfg["discovery_port"]))
+        host = peer.ip
         # Prefer the port the peer actually advertised unless overridden.
         if args.port is None:
-            port = found_port
+            port = peer.port
+        # Discovery replies are authenticated, so the advertised fingerprint is
+        # trustworthy enough to check the TLS certificate against before we
+        # authenticate to whoever answers on that address.
+        expect_fpr = peer.fingerprint or None
     try:
         results = send_files(host, port, args.files,
-                             device_name=cfg["device_name"], interactive=True)
+                             device_name=cfg["device_name"], interactive=True,
+                             expect_fingerprint=expect_fpr)
     except SendError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -196,10 +206,16 @@ def _cmd_discover(args: argparse.Namespace) -> int:
 
     cfg = cfg_mod.load_config()
     port = args.discovery_port or int(cfg["discovery_port"])
+    secret = cfg_mod.load_secret()
+    if not secret:
+        print("No shared secret set, so discovery cannot be authenticated.\n"
+              "Run 'lanshare init' first.", file=sys.stderr)
+        return 1
     print(f"Searching for LANShare devices (udp {port}, {args.timeout:.0f}s)...")
-    peers = discover(port, timeout=args.timeout)
+    peers = discover(port, secret, timeout=args.timeout)
     if not peers:
-        print("  No devices found. Make sure a receiver is running on the LAN.")
+        print("  No devices found. Make sure a receiver is running on the LAN "
+              "and is paired with the same shared secret.")
         return 0
     print(f"  Found {len(peers)} device(s):")
     for p in sorted(peers, key=lambda x: x.name):
