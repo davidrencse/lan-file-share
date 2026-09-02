@@ -40,10 +40,22 @@ class ProtocolError(Exception):
 
 
 def is_lan_address(ip: str) -> bool:
-    """True if *ip* is loopback, link-local, or RFC1918/ULA private space.
+    """True if *ip* is on a network this machine can reasonably call "local".
 
-    Public / routable addresses are rejected so the service only ever talks to
-    machines on the local network.
+    Three things qualify:
+
+    1. loopback and link-local addresses;
+    2. RFC1918 / ULA private space;
+    3. **any network this host actually has an interface on.**
+
+    (3) matters more than it sounds. Testing only for "private range" is a
+    common shortcut and it is wrong: a real home Wi-Fi observed while building
+    this hands out ``172.1.140.16/20``, which is public address space, so the
+    private-range test refused every peer on the user's own network -- inbound
+    connections, outbound connections and discovery alike.
+
+    Genuinely remote hosts are still rejected, because they are neither private
+    nor inside one of our own interface subnets.
     """
     try:
         addr = ipaddress.ip_address(ip)
@@ -51,11 +63,54 @@ def is_lan_address(ip: str) -> bool:
         return False
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
         addr = addr.ipv4_mapped
-    return (
-        addr.is_loopback
-        or addr.is_link_local
-        or addr.is_private  # includes RFC1918 and IPv6 ULA (fc00::/7)
-    )
+    if addr.is_loopback or addr.is_link_local or addr.is_private:
+        return True
+    return _on_a_local_network(addr)
+
+
+def _on_a_local_network(addr) -> bool:
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return False
+    from .localnet import local_ipv4_networks
+
+    for net in local_ipv4_networks():
+        if addr in net:
+            return True
+    for net in _extra_local_networks():
+        if addr in net:
+            return True
+    return False
+
+
+def _extra_local_networks() -> List[ipaddress.IPv4Network]:
+    """Networks the user has explicitly declared local, from the config file."""
+    try:
+        from . import config as cfg_mod
+
+        raw = cfg_mod.load_config().get("extra_local_networks") or []
+    except Exception:  # noqa: BLE001 -- config problems must not break the check
+        return []
+    nets = []
+    for item in raw:
+        try:
+            nets.append(ipaddress.ip_network(str(item), strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def describe_local_networks() -> str:
+    """Human-readable summary of what counts as local, for diagnostics."""
+    from .localnet import local_ipv4_networks
+
+    nets = [str(n) for n in local_ipv4_networks()]
+    extra = [str(n) for n in _extra_local_networks()]
+    parts = []
+    if nets:
+        parts.append("interfaces: " + ", ".join(nets))
+    if extra:
+        parts.append("manually trusted: " + ", ".join(extra))
+    return "; ".join(parts) or "no local networks detected"
 
 
 def local_ipv4_addresses() -> List[str]:

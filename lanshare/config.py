@@ -109,6 +109,11 @@ DEFAULTS: Dict[str, Any] = {
     "download_dir": None,          # None -> default_download_dir()
     "max_file_bytes": 100 * 1024 * 1024 * 1024,  # 100 GiB safety ceiling
     "discovery_enabled": True,
+    # Extra CIDRs to treat as local, for networks the OS probe cannot see (a
+    # VPN, or a segment reached through a router). Normally empty: the local
+    # interface subnets are detected automatically.
+    "extra_local_networks": [],
+    "wizard_done": False,
 }
 
 
@@ -135,6 +140,11 @@ def _coerce(cfg: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         cfg["max_file_bytes"] = DEFAULTS["max_file_bytes"]
     cfg["discovery_enabled"] = bool(cfg.get("discovery_enabled", True))
+    cfg["wizard_done"] = bool(cfg.get("wizard_done", False))
+    raw_nets = cfg.get("extra_local_networks")
+    cfg["extra_local_networks"] = (
+        [str(n) for n in raw_nets] if isinstance(raw_nets, list) else []
+    )
     if not isinstance(cfg.get("device_name"), str) or not cfg["device_name"].strip():
         cfg["device_name"] = DEFAULTS["device_name"]
     cfg["device_name"] = cfg["device_name"].strip()[:64]

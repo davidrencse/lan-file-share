@@ -5,6 +5,7 @@ The tests use a temporary LANSHARE_HOME so they never touch real config.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import socket
 import sys
@@ -164,6 +165,71 @@ def test_validate_size():
 
 
 # --- LAN restriction -------------------------------------------------------
+
+def test_interface_probe_finds_real_prefixes():
+    """The OS probe must work on this platform and report real prefix lengths.
+
+    Regression: the Windows path passed GAA_FLAG_SKIP_UNICAST by mistake, so it
+    silently returned nothing and fell back to assuming /24 for every address --
+    which wrongly refuses peers on a /16 or /20 network.
+    """
+    from lanshare import localnet
+
+    probe = localnet._windows_networks if os.name == "nt" else localnet._posix_networks
+    nets = probe()
+    assert nets, f"{probe.__name__} returned nothing; the fallback would hide real prefixes"
+    assert any(n.prefixlen != 24 for n in nets), \
+        "every prefix is /24, which suggests the /24 fallback rather than a real probe"
+
+
+def test_local_networks_contain_our_own_address():
+    from lanshare import localnet
+    from lanshare.netutil import local_ipv4_addresses
+
+    nets = localnet.local_ipv4_networks(force=True)
+    assert nets
+    mine = [ipaddress.ip_address(a) for a in local_ipv4_addresses()]
+    assert any(a in n for a in mine for n in nets), \
+        "none of our own addresses fall inside the detected local networks"
+
+
+def test_lan_check_accepts_our_network_even_outside_rfc1918():
+    """A real home Wi-Fi handed out 172.1.140.16/16 -- public space. Refusing it
+    made the whole app unusable on that network."""
+    from lanshare import localnet, netutil
+
+    real = localnet.local_ipv4_networks
+    localnet.local_ipv4_networks = lambda force=False: [
+        ipaddress.ip_network("172.1.0.0/16")
+    ]
+    try:
+        assert not ipaddress.ip_address("172.1.140.16").is_private  # public space
+        assert netutil.is_lan_address("172.1.140.16")   # ...but it is our network
+        assert netutil.is_lan_address("172.1.55.9")     # elsewhere on the same /16
+        # Still rejects the genuinely remote internet.
+        assert not netutil.is_lan_address("8.8.8.8")
+        assert not netutil.is_lan_address("93.184.216.34")
+        assert not netutil.is_lan_address("172.2.0.1")  # adjacent /16 we're not on
+    finally:
+        localnet.local_ipv4_networks = real
+
+
+def test_extra_local_networks_escape_hatch():
+    from lanshare import config as cfg_mod
+    from lanshare import localnet, netutil
+
+    real = localnet.local_ipv4_networks
+    localnet.local_ipv4_networks = lambda force=False: []
+    cfg = cfg_mod.load_config()
+    try:
+        assert not netutil.is_lan_address("100.64.5.5")
+        cfg_mod.save_config({**cfg, "extra_local_networks": ["100.64.0.0/10"]})
+        assert netutil.is_lan_address("100.64.5.5")
+        assert not netutil.is_lan_address("8.8.8.8")
+    finally:
+        localnet.local_ipv4_networks = real
+        cfg_mod.save_config(cfg)
+
 
 def test_is_lan_address():
     for good in ["127.0.0.1", "192.168.1.5", "10.0.0.3", "172.16.4.4",
