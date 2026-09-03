@@ -1,17 +1,25 @@
 """Sender side: connect to a receiver over TLS, authenticate, and stream files
-that the remote user approves."""
+that the remote user approves.
+
+A folder is sent as a *batch*: one ``batch`` message describing the whole
+folder, one approval from the remote user, then an ``offer``/data exchange per
+file carrying its path relative to the folder root. That needs protocol 2 on
+the receiving side; against an older receiver a folder send is refused, and
+plain-file sends are unchanged.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import socket
 import ssl
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import PROTOCOL_VERSION
 from . import config as cfg_mod
@@ -19,7 +27,7 @@ from . import history
 from . import identity
 from .auth import AuthError, client_authenticate
 from .netutil import ProtocolError, is_lan_address, recv_msg, send_msg
-from .safety import sanitize_display_text
+from .safety import human_size, sanitize_display_text
 from .tlsctx import client_context
 
 _CONNECT_TIMEOUT = 15.0
@@ -81,6 +89,65 @@ def _check_tofu(peer_name: str, fpr: str, *, interactive: bool,
     cfg_mod.save_known_peers(known)
 
 
+# One thing to send: an absolute path, the name that goes on the wire (relative
+# to its folder root, or a bare name for a lone file), and the name shown to the
+# user and recorded in history.
+_Entry = Tuple[Path, str, str]
+
+
+def _walk_folder(folder: Path, skipped: List[str]) -> Tuple[List[_Entry], int]:
+    """Collect the files inside *folder*, relative to it, plus their total size.
+
+    Symlinks are skipped rather than followed: a link can point outside the
+    folder the user chose, so following it would send something they never
+    selected, and a link back into the tree would loop.
+    """
+    entries: List[_Entry] = []
+    total = 0
+    root_name = folder.name or "folder"
+    for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
+        dirnames.sort()
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            if path.is_symlink() or not path.is_file():
+                skipped.append(str(path))
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                skipped.append(str(path))
+                continue
+            wire = path.relative_to(folder).as_posix()
+            entries.append((path, wire, root_name + "/" + wire))
+    return entries, total
+
+
+def _collect(files: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Turn the user's arguments into groups: one per folder, one per lone file."""
+    groups: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    for f in files:
+        p = Path(f).expanduser()
+        if p.is_dir() and not p.is_symlink():
+            entries, total = _walk_folder(p, skipped)
+            if not entries:
+                raise SendError(f"folder has no files to send: {f}")
+            groups.append({"folder": p.name or "folder", "entries": entries,
+                           "total": total})
+        elif p.is_file():
+            try:
+                total = p.stat().st_size
+            except OSError as exc:
+                raise SendError(f"cannot read {f}: {exc}") from exc
+            groups.append({"folder": None,
+                           "entries": [(p, p.name, p.name)], "total": total})
+        else:
+            raise SendError(f"not a readable file or folder: {f}")
+    if not groups:
+        raise SendError("no files to send")
+    return groups, skipped
+
+
 def send_files(host: str, port: int, files: Sequence[str], *,
                secret: Optional[bytes] = None, device_name: Optional[str] = None,
                interactive: bool = True, show_progress: bool = True,
@@ -89,7 +156,7 @@ def send_files(host: str, port: int, files: Sequence[str], *,
                tofu_confirm_cb: Optional[TofuConfirmFn] = None,
                cancel_event: Optional[threading.Event] = None,
                expect_fingerprint: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Send one or more files to a receiver. Returns a per-file result list."""
+    """Send files and/or folders to a receiver. Returns a per-file result list."""
 
     def log(msg: str) -> None:
         print(msg)
@@ -105,14 +172,7 @@ def send_files(host: str, port: int, files: Sequence[str], *,
     if not secret:
         raise SendError("No shared secret set. Run 'lanshare set-secret' first.")
 
-    paths: List[Path] = []
-    for f in files:
-        p = Path(f).expanduser()
-        if not p.exists() or not p.is_file():
-            raise SendError(f"not a readable file: {f}")
-        paths.append(p)
-    if not paths:
-        raise SendError("no files to send")
+    groups, skipped = _collect(files)
 
     # Resolve the address and confirm it is on the local network.
     try:
@@ -165,13 +225,23 @@ def send_files(host: str, port: int, files: Sequence[str], *,
                    tofu_confirm_cb=tofu_confirm_cb)
         log(f"  Connected to '{peer_name}' at {resolved_ip}:{port}")
 
+        peer_protocol = hello.get("protocol")
+        peer_protocol = peer_protocol if isinstance(peer_protocol, int) else 1
+        if any(g["folder"] for g in groups) and peer_protocol < 2:
+            raise SendError(
+                f"'{peer_name}' is running an older version of LANShare "
+                f"(protocol {peer_protocol}), which can only receive individual "
+                f"files. Update LANShare on that device to send folders, or "
+                f"select the files inside the folder instead."
+            )
+
+        for skipped_path in skipped:
+            log(f"  Skipping '{skipped_path}' (not a regular file)")
+
         results: List[Dict[str, Any]] = []
-        for path in paths:
-            if cancel_event is not None and cancel_event.is_set():
-                results.append({"file": str(path), "sent": False, "reason": "cancelled"})
-                continue
-            results.append(_send_one(tls, path, peer_name, show_progress, log,
-                                     progress_cb, cancel_event))
+        for group in groups:
+            results.extend(_send_group(tls, group, peer_name, show_progress, log,
+                                       progress_cb, cancel_event))
 
         _record_history(results, peer_name, resolved_ip)
         send_msg(tls, {"type": "bye"})
@@ -188,26 +258,71 @@ def send_files(host: str, port: int, files: Sequence[str], *,
             raw.close()
 
 
+def _send_group(tls: ssl.SSLSocket, group: Dict[str, Any], peer_name: str,
+                show_progress: bool, log: LogFn,
+                progress_cb: Optional[ProgressFn],
+                cancel_event: Optional[threading.Event]) -> List[Dict[str, Any]]:
+    """Send one folder (as a single approved batch) or one lone file."""
+    entries: List[_Entry] = group["entries"]
+    folder = group["folder"]
+    results: List[Dict[str, Any]] = []
+
+    if folder:
+        log(f"  Offering folder '{folder}' "
+            f"({len(entries)} files, {human_size(group['total'])}) ...")
+        send_msg(tls, {"type": "batch", "name": folder,
+                       "count": len(entries), "total_size": group["total"]})
+        decision = recv_msg(tls)
+        if decision.get("type") != "decision":
+            raise SendError("unexpected reply to folder offer")
+        if not decision.get("accept"):
+            reason = sanitize_display_text(decision.get("reason", "declined"), limit=120)
+            log(f"  Folder '{folder}' was not accepted: {reason}")
+            return [{"file": str(path), "name": display, "sent": False,
+                     "reason": reason} for path, _wire, display in entries]
+
+    try:
+        for path, wire, display in entries:
+            if cancel_event is not None and cancel_event.is_set():
+                results.append({"file": str(path), "name": display,
+                                "sent": False, "reason": "cancelled"})
+                continue
+            results.append(_send_one(tls, path, wire, display, peer_name,
+                                     show_progress, log, progress_cb, cancel_event))
+    finally:
+        # Always close the batch, even on cancellation or failure, so the
+        # receiver never holds an approval open for whatever we send next.
+        if folder:
+            try:
+                send_msg(tls, {"type": "batch_end"})
+            except (OSError, ssl.SSLError, ProtocolError):
+                pass
+    return results
+
+
 def _record_history(results: List[Dict[str, Any]], peer_name: str,
                     peer_ip: str) -> None:
     """Log each outcome so the Files page can show what we sent, and where."""
     for result in results:
         path = Path(result["file"])
+        # For a folder transfer this is "photos/2024/beach.jpg", so the Files
+        # page shows where the file sat rather than a bare name.
+        name = str(result.get("name") or path.name)
         try:
             size = path.stat().st_size
         except OSError:
             size = 0
         if result.get("sent"):
-            history.record_sent(path.name, size, peer_name, peer_ip,
+            history.record_sent(name, size, peer_name, peer_ip,
                                 status=history.OK)
         else:
             reason = str(result.get("reason", "not accepted"))
             status = history.DECLINED if "declin" in reason.lower() else history.FAILED
-            history.record_sent(path.name, size, peer_name, peer_ip,
+            history.record_sent(name, size, peer_name, peer_ip,
                                 status=status, error=reason)
 
 
-def _sha256_file(path: Path, progress_cb: Optional[ProgressFn],
+def _sha256_file(path: Path, display: str, progress_cb: Optional[ProgressFn],
                  cancel_event: Optional[threading.Event]) -> str:
     h = hashlib.sha256()
     size = path.stat().st_size
@@ -223,29 +338,30 @@ def _sha256_file(path: Path, progress_cb: Optional[ProgressFn],
             done += len(chunk)
             if progress_cb:
                 try:
-                    progress_cb(path.name, done, size, "hashing")
+                    progress_cb(display, done, size, "hashing")
                 except Exception:  # noqa: BLE001
                     pass
     return h.hexdigest()
 
 
-def _send_one(tls: ssl.SSLSocket, path: Path, peer_name: str, show_progress: bool,
+def _send_one(tls: ssl.SSLSocket, path: Path, wire_name: str, display: str,
+             peer_name: str, show_progress: bool,
              log: LogFn, progress_cb: Optional[ProgressFn],
              cancel_event: Optional[threading.Event]) -> Dict[str, Any]:
     size = path.stat().st_size
-    digest = _sha256_file(path, progress_cb, cancel_event)
+    digest = _sha256_file(path, display, progress_cb, cancel_event)
 
-    send_msg(tls, {"type": "offer", "name": path.name, "size": size, "sha256": digest})
+    send_msg(tls, {"type": "offer", "name": wire_name, "size": size, "sha256": digest})
     decision = recv_msg(tls)
     if decision.get("type") != "decision":
         raise SendError("unexpected reply to offer")
     if not decision.get("accept"):
         reason = decision.get("reason", "declined")
-        log(f"  '{path.name}' was not accepted: {reason}")
-        return {"file": str(path), "sent": False, "reason": reason}
+        log(f"  '{display}' was not accepted: {reason}")
+        return {"file": str(path), "name": display, "sent": False, "reason": reason}
 
-    stored_as = decision.get("stored_as", path.name)
-    log(f"  Sending '{path.name}' -> '{stored_as}' ...")
+    stored_as = sanitize_display_text(decision.get("stored_as", display), limit=120)
+    log(f"  Sending '{display}' -> '{stored_as}' ...")
 
     sent = 0
     start = time.monotonic()
@@ -260,7 +376,7 @@ def _send_one(tls: ssl.SSLSocket, path: Path, peer_name: str, show_progress: boo
             chunk = fh.read(min(_CHUNK, size - sent))
             if not chunk:
                 raise SendError(
-                    f"'{path.name}' shrank while it was being sent "
+                    f"'{display}' shrank while it was being sent "
                     f"({sent} of {size} bytes available); transfer aborted"
                 )
             tls.sendall(chunk)
@@ -269,7 +385,7 @@ def _send_one(tls: ssl.SSLSocket, path: Path, peer_name: str, show_progress: boo
                 _console_progress(sent, size, start)
             if progress_cb:
                 try:
-                    progress_cb(path.name, sent, size, "sending")
+                    progress_cb(display, sent, size, "sending")
                 except Exception:  # noqa: BLE001
                     pass
     if show_progress:
@@ -285,7 +401,8 @@ def _send_one(tls: ssl.SSLSocket, path: Path, peer_name: str, show_progress: boo
         raise SendError("receiver's sha256 did not match; transfer may be corrupt")
 
     log(f"  Done: '{stored_as}' delivered and verified.")
-    return {"file": str(path), "sent": True, "stored_as": stored_as, "sha256": digest}
+    return {"file": str(path), "name": display, "sent": True,
+            "stored_as": stored_as, "sha256": digest}
 
 
 def _console_progress(sent: int, total: int, start: float) -> None:

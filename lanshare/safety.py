@@ -4,6 +4,10 @@ Everything a remote peer sends about a file is treated as hostile input:
 
   * File names are reduced to a bare, sanitized base name -- no directory
     components, no traversal, no reserved device names, no control characters.
+  * Folder transfers are the one case where structure is preserved, and only
+    through :func:`sanitize_relpath`, which applies the same rules to every
+    component and refuses traversal, plus :func:`reserve_destination_at`, which
+    re-proves containment after each directory it creates.
   * The destination is always inside the configured download directory, verified
     by resolving the real path and confirming containment.
   * Sizes are validated against a configured ceiling and against free disk
@@ -32,6 +36,10 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _ILLEGAL = re.compile(r'[<>:"/|?*]')
 
 MAX_NAME_LEN = 200
+# Ceilings for folder transfers. A peer that declares a 500-deep tree or a
+# 10,000-character path is not doing anything legitimate.
+MAX_RELPATH_DEPTH = 32
+MAX_RELPATH_LEN = 1024
 
 
 class UnsafeFileError(Exception):
@@ -122,6 +130,39 @@ def sanitize_filename(raw: str) -> str:
     return name
 
 
+def sanitize_relpath(raw: str) -> str:
+    """Return a safe *relative* path derived from an untrusted string.
+
+    Used only for files inside an approved folder transfer. Every component
+    goes through :func:`sanitize_filename`, so each one is independently safe;
+    on top of that, any traversal component is rejected outright rather than
+    escaped, and depth and length are capped. The result always uses ``/`` as
+    its separator, which is what goes on the wire.
+    """
+    if not isinstance(raw, str) or not raw:
+        raise UnsafeFileError("empty path")
+    if len(raw) > MAX_RELPATH_LEN:
+        raise UnsafeFileError("path is too long")
+
+    raw = unicodedata.normalize("NFC", raw)
+    parts = []
+    for component in raw.split("/"):
+        if component in ("", "."):
+            continue
+        # ".." and friends are refused, not sanitized: inside a folder transfer
+        # there is no legitimate reason for one, so quietly rewriting it would
+        # hide a hostile sender rather than reveal it.
+        if set(component) <= {"."}:
+            raise UnsafeFileError(f"path traversal in {raw!r}")
+        parts.append(sanitize_filename(component))
+
+    if not parts:
+        raise UnsafeFileError(f"path reduces to nothing safe: {raw!r}")
+    if len(parts) > MAX_RELPATH_DEPTH:
+        raise UnsafeFileError(f"path is nested too deeply ({len(parts)} levels)")
+    return "/".join(parts)
+
+
 def validate_size(size: int, max_bytes: int) -> None:
     """Validate a declared file size against the configured ceiling."""
     if not isinstance(size, int) or isinstance(size, bool):
@@ -175,6 +216,92 @@ def reserve_destination(download_dir: Path, safe_name: str) -> Path:
     for i in range(0, 10000):
         name = safe_name if i == 0 else f"{root} ({i}){ext}"
         candidate = _contained_candidate(download_dir, name)
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise UnsafeFileError(f"cannot create destination: {exc}") from exc
+        os.close(fd)
+        return candidate
+    raise UnsafeFileError("too many name collisions in download directory")
+
+
+def _assert_within(root: Path, path: Path) -> Path:
+    """Prove that *path* really lives inside *root*, following any symlinks."""
+    resolved = path.resolve()
+    try:
+        # Path.is_relative_to() would read better but only exists on 3.9+,
+        # and this package supports 3.8.
+        resolved.relative_to(root)
+    except ValueError:
+        raise UnsafeFileError(
+            "destination escapes the download directory"
+        ) from None
+    return resolved
+
+
+def reserve_batch_root(download_dir: Path, safe_name: str) -> Path:
+    """Create and claim a fresh top-level folder for one folder transfer.
+
+    De-duplication happens once, here, on the folder name -- so a second copy
+    of "photos" arrives as "photos (1)" with its tree intact, instead of the
+    collision suffix being scattered over every file inside it.
+
+    The name must already have been through :func:`sanitize_filename`.
+    """
+    download_dir = download_dir.resolve()
+    for i in range(0, 10000):
+        name = safe_name if i == 0 else f"{safe_name} ({i})"
+        candidate = download_dir / name
+        if candidate.resolve().parent != download_dir:
+            raise UnsafeFileError("destination escapes the download directory")
+        try:
+            os.mkdir(candidate, 0o700)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise UnsafeFileError(f"cannot create destination folder: {exc}") from exc
+        return candidate
+    raise UnsafeFileError("too many name collisions in download directory")
+
+
+def reserve_destination_at(root: Path, relpath: str) -> Path:
+    """Claim a free path at *relpath* inside *root*, creating parents.
+
+    The nested equivalent of :func:`reserve_destination`: the leaf is still
+    claimed with ``O_EXCL`` so nothing else can pick the same path, and
+    containment is re-proved after every directory that is created or reused,
+    so a subdirectory that already exists as a symlink pointing elsewhere is
+    caught instead of being written through.
+
+    *relpath* must already have been through :func:`sanitize_relpath`.
+    """
+    root = root.resolve()
+    parts = relpath.split("/")
+    if len(parts) > MAX_RELPATH_DEPTH:
+        raise UnsafeFileError("path is nested too deeply")
+
+    parent = root
+    for component in parts[:-1]:
+        parent = parent / component
+        try:
+            os.mkdir(parent, 0o700)
+        except FileExistsError:
+            if parent.is_symlink() or not parent.is_dir():
+                raise UnsafeFileError(
+                    "destination path component is not a real directory"
+                ) from None
+        except OSError as exc:
+            raise UnsafeFileError(f"cannot create destination: {exc}") from exc
+        _assert_within(root, parent)
+
+    leaf = parts[-1]
+    stem, ext = os.path.splitext(leaf)
+    for i in range(0, 10000):
+        name = leaf if i == 0 else f"{stem} ({i}){ext}"
+        candidate = parent / name
+        _assert_within(root, candidate)
         try:
             fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:

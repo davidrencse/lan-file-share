@@ -33,21 +33,30 @@ class _BaseDialog(QDialog):
 
 
 class IncomingRequestDialog(_BaseDialog):
-    """Asks the user to accept or decline one incoming file transfer."""
+    """Asks the user to accept or decline one incoming transfer.
+
+    A folder arrives as a single request covering everything inside it, so the
+    dialog says how many files and how much data that is -- the user is
+    approving all of it at once, and should be told so.
+    """
 
     def __init__(self, info: Dict[str, Any], parent: Optional[QWidget] = None,
                  timeout_seconds: int = 120):
-        super().__init__("Incoming file", parent)
+        is_folder = info.get("kind") == "folder"
+        super().__init__("Incoming folder" if is_folder else "Incoming file", parent)
         self.accepted_choice = False
 
         header = QHBoxLayout()
         from PySide6.QtWidgets import QLabel
         pic = QLabel()
-        pic.setPixmap(icons.pixmap("download_cloud", size=26, color=PALETTE.accent))
+        pic.setPixmap(icons.pixmap("folder" if is_folder else "download_cloud",
+                                   size=26, color=PALETTE.accent))
         header.addWidget(pic)
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
-        title_col.addWidget(label("Incoming file transfer", "h2"))
+        title_col.addWidget(label(
+            "Incoming folder transfer" if is_folder else "Incoming file transfer",
+            "h2"))
         sub = f"From {info['peer_name']}  ·  {info['peer_ip']}"
         title_col.addWidget(label(sub, "secondary"))
         header.addLayout(title_col)
@@ -66,11 +75,20 @@ class IncomingRequestDialog(_BaseDialog):
         file_col.addWidget(name_lbl)
         if info["safe_name"] != info["raw_name"]:
             file_col.addWidget(label(f"sent as “{info['raw_name']}”", "muted"))
-        file_col.addWidget(label(human_size(info["size"]), "secondary"))
+        if is_folder:
+            count = int(info.get("count", 0))
+            file_col.addWidget(label(
+                f"{count} file{'s' if count != 1 else ''}  ·  "
+                f"{human_size(info['size'])}", "secondary"))
+        else:
+            file_col.addWidget(label(human_size(info["size"]), "secondary"))
         file_row.addLayout(file_col, 1)
         self.body().addLayout(file_row)
 
-        dest_lbl = label(f"Will be saved to:  {info['download_dir']}", "muted")
+        dest_note = f"Will be saved to:  {info['download_dir']}"
+        if is_folder:
+            dest_note += f"  (in a new “{info['safe_name']}” folder)"
+        dest_lbl = label(dest_note, "muted")
         dest_lbl.setWordWrap(True)
         self.body().addWidget(dest_lbl)
 

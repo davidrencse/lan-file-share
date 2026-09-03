@@ -1,5 +1,14 @@
 """Receiver side: a TLS server that authenticates, asks for approval, and
-writes incoming files safely into the download directory."""
+writes incoming files safely into the download directory.
+
+A folder arrives as a *batch*: a ``batch`` message describing the whole folder
+is approved once, a fresh top-level directory is claimed for it, and the files
+that follow are written at their declared relative paths inside that directory
+until a ``batch_end`` closes it. The individual files are not re-prompted, but
+every other check still runs on each one -- the path is re-sanitized component
+by component, the size is validated, containment is re-proved -- and the batch
+is capped at the file count and total size it declared.
+"""
 
 from __future__ import annotations
 
@@ -35,9 +44,12 @@ from .safety import (
     human_size,
     partial_path,
     release_destination,
+    reserve_batch_root,
     reserve_destination,
+    reserve_destination_at,
     sanitize_display_text,
     sanitize_filename,
+    sanitize_relpath,
     validate_size,
 )
 from .tlsctx import server_context
@@ -51,6 +63,9 @@ _DATA_TIMEOUT = 120.0
 _CHUNK = 1024 * 1024
 # Connections served at once. Bounded so a flood cannot exhaust memory/threads.
 _MAX_CONCURRENT = 8
+# A single folder transfer cannot declare more files than this. One approval
+# covers everything inside it, so the number it covers has to be bounded.
+_MAX_BATCH_FILES = 20000
 
 
 # An approval callback returns True to accept a transfer. Default is interactive.
@@ -65,17 +80,22 @@ CompleteFn = Callable[[Dict[str, Any]], None]
 
 
 def _interactive_approval(info: Dict[str, Any]) -> bool:
+    folder = info.get("kind") == "folder"
     print()
-    print("  Incoming file transfer request")
+    print(f"  Incoming {'folder' if folder else 'file'} transfer request")
     print(f"    From        : {info['peer_name']}  ({info['peer_ip']})")
-    print(f"    File        : {info['safe_name']}")
+    print(f"    {'Folder' if folder else 'File'}        : {info['safe_name']}")
     if info["safe_name"] != info["raw_name"]:
         print(f"    (original)  : {info['raw_name']}")
+    if folder:
+        print(f"    Contains    : {info['count']} files")
     print(f"    Size        : {human_size(info['size'])}")
     print(f"    Will save to: {info['download_dir']}")
     print()
+    prompt = "  Accept this folder and everything in it? [y/N] " if folder \
+        else "  Accept this file? [y/N] "
     try:
-        answer = input("  Accept this file? [y/N] ").strip().lower()
+        answer = input(prompt).strip().lower()
     except EOFError:
         return False
     return answer in {"y", "yes"}
@@ -324,27 +344,132 @@ class Receiver:
             _close(tls, raw_sock)
 
     def _session(self, tls: ssl.SSLSocket, peer_ip: str, peer_name: str) -> None:
-        """Handle one or more file offers on an authenticated connection."""
+        """Handle one or more file offers on an authenticated connection.
+
+        The open batch, if any, is a local -- connections are served
+        concurrently on separate threads, so it must never live on ``self``.
+        """
+        batch: Optional[Dict[str, Any]] = None
         while not self._stop_flag.is_set():
             msg = recv_msg(tls)
             mtype = msg.get("type")
             if mtype == "bye":
                 return
+            if mtype == "batch":
+                if batch is not None:
+                    raise ProtocolError("a folder transfer is already in progress")
+                batch = self._handle_batch(tls, peer_ip, peer_name, msg)
+                continue
+            if mtype == "batch_end":
+                if batch is None:
+                    raise ProtocolError("batch_end without a folder transfer")
+                if batch["accepted"]:
+                    self._log(f"  Finished folder '{batch['name']}' from {peer_name}")
+                batch = None
+                continue
             if mtype != "offer":
                 raise ProtocolError(f"unexpected message: {mtype!r}")
-            self._handle_offer(tls, peer_ip, peer_name, msg)
+            self._handle_offer(tls, peer_ip, peer_name, msg, batch)
+
+    def _handle_batch(self, tls: ssl.SSLSocket, peer_ip: str, peer_name: str,
+                      msg: Dict[str, Any]) -> Dict[str, Any]:
+        """Approve (or decline) one whole folder and claim a directory for it.
+
+        Returns the batch state either way: a declined batch still has to be
+        remembered, so the offers that follow are refused without prompting the
+        user once per file.
+        """
+        raw_name = str(msg.get("name", ""))
+        count = msg.get("count")
+        total = msg.get("total_size")
+        declined = {"accepted": False, "root": None, "name": "", "remaining": 0,
+                    "budget": 0}
+
+        try:
+            safe_name = sanitize_filename(raw_name)
+            if (not isinstance(count, int) or isinstance(count, bool)
+                    or not 0 < count <= _MAX_BATCH_FILES):
+                raise UnsafeFileError(f"implausible file count in folder offer: {count!r}")
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                raise UnsafeFileError("folder offer declared an invalid total size")
+            check_free_space(self.download_dir, total)
+        except UnsafeFileError as exc:
+            self._log(f"  Rejected folder from {peer_name}: {exc}", err=True)
+            send_msg(tls, {"type": "decision", "accept": False, "reason": str(exc)})
+            return declined
+        except OSError as exc:
+            self._log(f"  Cannot accept folder from {peer_name}: {exc}", err=True)
+            send_msg(tls, {"type": "decision", "accept": False,
+                           "reason": "receiver cannot store the folder right now"})
+            return declined
+
+        info = {
+            "kind": "folder",
+            "peer_name": peer_name,
+            "peer_ip": peer_ip,
+            "raw_name": sanitize_display_text(raw_name, limit=120),
+            "safe_name": safe_name,
+            "size": total,
+            "count": count,
+            "download_dir": str(self.download_dir),
+        }
+        with self._approval_lock:
+            try:
+                accepted = self.approval(info)
+            except KeyboardInterrupt:
+                accepted = False
+
+        if not accepted:
+            self._log(f"  Declined folder '{safe_name}' from {peer_name}")
+            send_msg(tls, {"type": "decision", "accept": False,
+                           "reason": "declined by user"})
+            return declined
+
+        try:
+            root = reserve_batch_root(self.download_dir, safe_name)
+        except UnsafeFileError as exc:
+            self._log(f"  Cannot store folder '{safe_name}': {exc}", err=True)
+            send_msg(tls, {"type": "decision", "accept": False,
+                           "reason": "receiver could not allocate a destination"})
+            return declined
+
+        send_msg(tls, {"type": "decision", "accept": True, "stored_as": root.name})
+        self._log(f"  Accepting folder '{root.name}' ({count} files, "
+                  f"{human_size(total)}) from {peer_name}")
+        return {"accepted": True, "root": root, "name": root.name,
+                "remaining": count, "budget": total}
 
     def _handle_offer(self, tls: ssl.SSLSocket, peer_ip: str, peer_name: str,
-                      msg: Dict[str, Any]) -> None:
+                      msg: Dict[str, Any],
+                      batch: Optional[Dict[str, Any]] = None) -> None:
         raw_name = str(msg.get("name", ""))
         size = msg.get("size")
         declared_sha = msg.get("sha256")
 
+        if batch is not None and not batch["accepted"]:
+            send_msg(tls, {"type": "decision", "accept": False,
+                           "reason": "the folder this file belongs to was declined"})
+            return
+        in_batch = batch is not None
+
         # Validate everything before we even show the prompt.
         try:
-            safe_name = sanitize_filename(raw_name)
+            # Inside a batch the name is a relative path, so each component is
+            # sanitized separately; on its own it is still a bare name.
+            safe_name = sanitize_relpath(raw_name) if in_batch \
+                else sanitize_filename(raw_name)
             validate_size(size if isinstance(size, int) else -1, self.max_bytes)
             check_free_space(self.download_dir, int(size))
+            if in_batch:
+                # The approval covered a stated number of files and a stated
+                # total; a sender that exceeds either is not sending what the
+                # user agreed to.
+                if batch["remaining"] <= 0:
+                    raise UnsafeFileError(
+                        "folder sent more files than it declared")
+                if int(size) > batch["budget"]:
+                    raise UnsafeFileError(
+                        "folder sent more data than it declared")
         except UnsafeFileError as exc:
             self._log(f"  Rejected offer from {peer_name}: {exc}", err=True)
             send_msg(tls, {"type": "decision", "accept": False, "reason": str(exc)})
@@ -355,47 +480,68 @@ class Receiver:
                            "reason": "receiver cannot store the file right now"})
             return
 
-        info = {
-            "peer_name": peer_name,
-            "peer_ip": peer_ip,
-            "raw_name": sanitize_display_text(raw_name, limit=120),
-            "safe_name": safe_name,
-            "size": int(size),
-            "download_dir": str(self.download_dir),
-        }
-        # Only one prompt at a time, even with several connections in flight.
-        with self._approval_lock:
-            try:
-                accepted = self.approval(info)
-            except KeyboardInterrupt:
-                accepted = False
+        if not in_batch:
+            info = {
+                "kind": "file",
+                "peer_name": peer_name,
+                "peer_ip": peer_ip,
+                "raw_name": sanitize_display_text(raw_name, limit=120),
+                "safe_name": safe_name,
+                "size": int(size),
+                "download_dir": str(self.download_dir),
+            }
+            # Only one prompt at a time, even with several connections in flight.
+            with self._approval_lock:
+                try:
+                    accepted = self.approval(info)
+                except KeyboardInterrupt:
+                    accepted = False
 
-        if not accepted:
-            self._log(f"  Declined '{safe_name}' from {peer_name}")
-            history.record_received(safe_name, int(size), peer_name, peer_ip,
-                                    path=None, status=history.DECLINED)
-            send_msg(tls, {"type": "decision", "accept": False, "reason": "declined by user"})
-            return
+            if not accepted:
+                self._log(f"  Declined '{safe_name}' from {peer_name}")
+                history.record_received(safe_name, int(size), peer_name, peer_ip,
+                                        path=None, status=history.DECLINED)
+                send_msg(tls, {"type": "decision", "accept": False,
+                               "reason": "declined by user"})
+                return
 
         # Claim the destination name atomically so two concurrent transfers (or
         # anything else on the machine) cannot pick the same path.
         try:
-            dest = reserve_destination(self.download_dir, safe_name)
+            if in_batch:
+                dest = reserve_destination_at(batch["root"], safe_name)
+            else:
+                dest = reserve_destination(self.download_dir, safe_name)
         except UnsafeFileError as exc:
             self._log(f"  Cannot store '{safe_name}': {exc}", err=True)
             send_msg(tls, {"type": "decision", "accept": False,
                            "reason": "receiver could not allocate a destination"})
             return
 
+        display = f"{batch['name']}/{safe_name}" if in_batch else dest.name
+        if in_batch:
+            batch["remaining"] -= 1
+            batch["budget"] -= int(size)
+
         try:
-            send_msg(tls, {"type": "decision", "accept": True, "stored_as": dest.name})
-            self._receive_file(tls, dest, int(size), declared_sha, peer_name, peer_ip)
+            # Inside a folder, report the whole path we stored it at, so the
+            # sender's log reads "photos/a.jpg -> photos/a.jpg" rather than
+            # appearing to have flattened the tree.
+            send_msg(tls, {"type": "decision", "accept": True,
+                           "stored_as": display})
+            self._receive_file(tls, dest, int(size), declared_sha, peer_name,
+                               peer_ip, display)
         except BaseException:
             release_destination(dest)
             raise
 
     def _receive_file(self, tls: ssl.SSLSocket, dest: Path, size: int,
-                      declared_sha: Any, peer_name: str, peer_ip: str = "") -> None:
+                      declared_sha: Any, peer_name: str, peer_ip: str = "",
+                      display: Optional[str] = None) -> None:
+        # For a file inside a folder transfer *display* is "photos/beach.jpg",
+        # so progress, logs and history say where it landed rather than showing
+        # a bare name out of context.
+        display = display or dest.name
         tmp = partial_path(dest)
         hasher = hashlib.sha256()
         received = 0
@@ -413,7 +559,7 @@ class Receiver:
                     received += len(chunk)
                     if self.progress_cb:
                         try:
-                            self.progress_cb(dest.name, received, size)
+                            self.progress_cb(display, received, size)
                         except Exception:  # noqa: BLE001
                             pass
             actual_sha = hasher.hexdigest()
@@ -426,16 +572,16 @@ class Receiver:
             # Recorded only here: past the checksum check and past the rename,
             # so a record of "ok" always means the file really is on disk and
             # verified.
-            history.record_received(dest.name, size, peer_name, peer_ip,
+            history.record_received(display, size, peer_name, peer_ip,
                                     path=str(dest), status=history.OK)
             if self.complete_cb:
                 try:
-                    self.complete_cb({"name": dest.name, "size": size,
+                    self.complete_cb({"name": display, "size": size,
                                       "path": str(dest), "peer_name": peer_name,
                                       "status": history.OK})
                 except Exception:  # noqa: BLE001
                     pass
-            self._log(f"  Saved '{dest.name}' ({human_size(size)}) from {peer_name}")
+            self._log(f"  Saved '{display}' ({human_size(size)}) from {peer_name}")
             send_msg(tls, {
                 "type": "result", "ok": True,
                 "stored_as": dest.name, "sha256": actual_sha,
@@ -446,19 +592,19 @@ class Receiver:
                     tmp.unlink()
             except OSError:
                 pass
-            history.record_received(dest.name, size, peer_name, peer_ip,
+            history.record_received(display, size, peer_name, peer_ip,
                                     path=None, status=history.FAILED,
                                     error=str(exc))
             if self.complete_cb:
                 try:
-                    self.complete_cb({"name": dest.name, "size": size,
+                    self.complete_cb({"name": display, "size": size,
                                       "path": None, "peer_name": peer_name,
                                       "status": history.FAILED, "error": str(exc)})
                 except Exception:  # noqa: BLE001
                     pass
             # Detail stays local; the peer gets a generic reason so local paths
             # and disk layout are not disclosed over the wire.
-            self._log(f"  Transfer of '{dest.name}' failed: {exc}", err=True)
+            self._log(f"  Transfer of '{display}' failed: {exc}", err=True)
             _safe_send(tls, {"type": "result", "ok": False,
                              "error": "receiver could not store the file"})
             raise

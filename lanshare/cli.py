@@ -230,7 +230,7 @@ def _cmd_send(args: argparse.Namespace) -> int:
         # authenticate to whoever answers on that address.
         expect_fpr = peer.fingerprint or None
     try:
-        results = send_files(host, port, args.files,
+        results = send_files(host, port, args.paths,
                              device_name=cfg["device_name"], interactive=True,
                              expect_fingerprint=expect_fpr)
     except SendError as exc:
@@ -330,9 +330,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="auto-accept all transfers (INSECURE; testing only)")
     pr.set_defaults(func=_cmd_receive)
 
-    psn = sub.add_parser("send", help="send file(s) to a receiver")
+    psn = sub.add_parser("send", help="send files or folders to a receiver")
     psn.add_argument("target", help="receiver IP/hostname, or device name with --find")
-    psn.add_argument("files", nargs="+", help="one or more files to send")
+    psn.add_argument("paths", nargs="+", metavar="PATH",
+                     help="one or more files or folders to send")
     psn.add_argument("--port", type=int, help="receiver TCP port")
     psn.add_argument("--find", action="store_true",
                      help="treat target as a device name and locate it via discovery")

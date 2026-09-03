@@ -147,8 +147,8 @@ The GUI and CLI share the same engine; anything you can do in one you can do in 
 | `lanshare set-secret [SECRET]` | Paste the secret from your other device |
 | `lanshare show-secret` | Print the secret and Secret ID for pairing |
 | `lanshare info` | Device name, **the address to give others**, Secret ID, local networks |
-| `lanshare receive` | Wait for incoming files (prompts before each one) |
-| `lanshare send TARGET FILE...` | Send to an IP, or to a device name with `--find` |
+| `lanshare receive` | Wait for incoming transfers (prompts for each file, or once per folder) |
+| `lanshare send TARGET PATH...` | Send files or folders to an IP, or to a device name with `--find` |
 | `lanshare discover` | List devices on the network |
 | `lanshare config --trust-network CIDR` | Treat another subnet as local |
 | `lanshare selftest` | Verify the install with a full loopback transfer |
@@ -163,7 +163,15 @@ lanshare receive
 # on the sending machine
 lanshare set-secret <the-secret>
 lanshare send desktop-bob ./report.pdf --find
+lanshare send desktop-bob ./holiday-photos --find   # whole folder, one prompt
 ```
+
+A folder keeps its structure: the receiver recreates the tree inside its
+download directory (as `holiday-photos`, or `holiday-photos (1)` if that name
+is taken) and asks for approval once for the whole thing rather than once per
+file. Symlinks inside a folder are skipped rather than followed. Sending a
+folder needs the updated version on both devices; against an older receiver the
+send is refused with a message saying so, and single files work as before.
 
 ## Install without the GUI
 

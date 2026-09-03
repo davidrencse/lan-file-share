@@ -17,7 +17,7 @@ See the README for usage.
 __version__ = "1.0.0"
 
 # Wire-protocol version. Bump when the framing / message shapes change.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # Default TCP port for the TLS transfer service.
 DEFAULT_PORT = 51888

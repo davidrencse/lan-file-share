@@ -380,6 +380,188 @@ def test_round_trip_accept():
     assert stored.read_bytes() == payload
 
 
+def _expect_unsafe(fn, *args):
+    try:
+        fn(*args)
+        assert False, f"expected rejection for {args!r}"
+    except UnsafeFileError:
+        pass
+
+
+def test_sanitize_relpath_accepts_a_tree_and_refuses_traversal():
+    assert safety.sanitize_relpath("photos/2024/beach.jpg") == "photos/2024/beach.jpg"
+    # Redundant separators and "." components collapse away.
+    assert safety.sanitize_relpath("a//./b.txt") == "a/b.txt"
+    # A leading slash is not an absolute path once the empty component is gone.
+    assert safety.sanitize_relpath("/a/b.txt") == "a/b.txt"
+    # Every component still goes through the single-name rules.
+    assert safety.sanitize_relpath('a/na<>me:"?.txt') == "a/na__me___.txt"
+    for bad in ["..", "../x", "a/../../b", "a/..", "photos/../../etc/passwd",
+                "/", "", "."]:
+        _expect_unsafe(safety.sanitize_relpath, bad)
+    _expect_unsafe(safety.sanitize_relpath,
+                   "/".join(["a"] * (safety.MAX_RELPATH_DEPTH + 1)))
+    _expect_unsafe(safety.sanitize_relpath, "x" * (safety.MAX_RELPATH_LEN + 1))
+
+
+def test_reserve_batch_root_deduplicates_the_folder_name():
+    d = Path(tempfile.mkdtemp())
+    first = safety.reserve_batch_root(d, "photos")
+    second = safety.reserve_batch_root(d, "photos")
+    assert first.name == "photos" and second.name == "photos (1)"
+    assert first.is_dir() and second.is_dir()
+
+
+def test_reserve_destination_at_creates_the_tree_and_avoids_collisions():
+    d = Path(tempfile.mkdtemp())
+    root = safety.reserve_batch_root(d, "photos")
+    first = safety.reserve_destination_at(root, "2024/beach.jpg")
+    assert first.relative_to(root) == Path("2024/beach.jpg")
+    assert first.exists()
+    second = safety.reserve_destination_at(root, "2024/beach.jpg")
+    assert second.name == "beach (1).jpg"
+
+
+def test_reserve_destination_at_refuses_a_symlinked_subdirectory():
+    """A subdirectory that is really a link out must not be written through."""
+    d = Path(tempfile.mkdtemp())
+    outside = Path(tempfile.mkdtemp())
+    root = safety.reserve_batch_root(d, "photos")
+    try:
+        os.symlink(outside, root / "escape", target_is_directory=True)
+    except (OSError, AttributeError, NotImplementedError) as exc:
+        # Windows refuses this without the right privilege; nothing to test.
+        print(f"  (skipped: cannot create a symlink here: {exc})")
+        return
+    _expect_unsafe(safety.reserve_destination_at, root, "escape/evil.txt")
+    assert not (outside / "evil.txt").exists()
+
+
+def _make_tree(root: Path):
+    """A small nested tree, returned as {relative path: bytes}."""
+    files = {
+        "top.txt": b"top-level",
+        "2024/beach.jpg": os.urandom(2048),
+        "2024/raw/IMG_1.dng": os.urandom(4096),
+        "notes/.hidden": b"dotfile survives",
+    }
+    for rel, payload in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    return files
+
+
+def _folder_to_send():
+    parent = Path(tempfile.mkdtemp(prefix="lanshare-src-"))
+    folder = parent / "photos"
+    folder.mkdir()
+    return folder, _make_tree(folder)
+
+
+def test_round_trip_folder_is_one_approval_and_keeps_its_tree():
+    folder, files = _folder_to_send()
+    prompts = []
+
+    def approval(info):
+        prompts.append(info)
+        return True
+
+    dl, results, err, rerr = _do_transfer(approval, [str(folder)])
+    assert err is None, err
+    assert rerr is None, rerr
+
+    # One prompt for the whole folder, not one per file.
+    assert len(prompts) == 1
+    assert prompts[0]["kind"] == "folder"
+    assert prompts[0]["safe_name"] == "photos"
+    assert prompts[0]["count"] == len(files)
+    assert prompts[0]["size"] == sum(len(v) for v in files.values())
+
+    assert results and all(r["sent"] for r in results)
+    # Every file landed at its original relative path, with its content intact.
+    stored_root = dl / "photos"
+    for rel, payload in files.items():
+        assert (stored_root / rel).read_bytes() == payload
+    # ...and nothing was scattered into the download root itself.
+    assert [p.name for p in dl.iterdir()] == ["photos"]
+    # Results (and so history) name files by their path inside the folder.
+    assert {r["name"] for r in results} == {f"photos/{rel}" for rel in files}
+
+
+def test_round_trip_folder_declined_writes_nothing():
+    folder, files = _folder_to_send()
+    prompts = []
+
+    def approval(info):
+        prompts.append(info)
+        return False
+
+    dl, results, err, rerr = _do_transfer(approval, [str(folder)])
+    assert err is None, err
+    # Declined once for the folder; the files inside are never asked about.
+    assert len(prompts) == 1
+    assert results and not any(r["sent"] for r in results)
+    assert len(results) == len(files)
+    assert not any(dl.iterdir())
+
+
+def test_folder_send_refused_against_an_older_receiver():
+    """A protocol-1 receiver can only take flat files, so say so up front."""
+    import lanshare.receiver as receiver_mod
+    import lanshare.sender as sender_mod
+
+    folder, _files = _folder_to_send()
+    original = receiver_mod.PROTOCOL_VERSION
+    try:
+        receiver_mod.PROTOCOL_VERSION = 1
+        dl, results, err, rerr = _do_transfer(lambda info: True, [str(folder)])
+    finally:
+        receiver_mod.PROTOCOL_VERSION = original
+
+    assert isinstance(err, sender_mod.SendError), err
+    assert "older version" in str(err)
+    assert not any(dl.iterdir())
+
+
+def test_nested_offer_outside_a_batch_is_still_flattened():
+    """Without an approved folder, a path in an offer is collapsed as before.
+
+    This is what keeps the receiver's batch state -- not the sender's say-so --
+    in charge of whether directories get created at all.
+    """
+    src = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "photo.bin"
+    src.write_bytes(b"payload")
+
+    import lanshare.sender as sender_mod
+
+    real_send_msg = sender_mod.send_msg
+
+    def sneaky_send_msg(tls, obj):
+        if obj.get("type") == "offer":
+            obj = dict(obj, name="../../../evil/pwned.bin")
+        return real_send_msg(tls, obj)
+
+    prompts = []
+
+    def approval(info):
+        prompts.append(info)
+        return True
+
+    try:
+        sender_mod.send_msg = sneaky_send_msg
+        dl, results, err, rerr = _do_transfer(approval, [str(src)])
+    finally:
+        sender_mod.send_msg = real_send_msg
+
+    assert err is None, err
+    # Prompted as a plain file with the traversal stripped, and written flat.
+    assert len(prompts) == 1 and prompts[0]["kind"] == "file"
+    assert prompts[0]["safe_name"] == "pwned.bin"
+    assert [p.name for p in dl.iterdir()] == ["pwned.bin"]
+    assert (dl / "pwned.bin").read_bytes() == b"payload"
+
+
 def test_round_trip_decline():
     workdir = Path(tempfile.mkdtemp(prefix="lanshare-src-"))
     src = workdir / "photo.bin"

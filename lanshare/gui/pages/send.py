@@ -1,11 +1,13 @@
-"""The send flow: pick files, pick a target device, watch progress, see results."""
+"""The send flow: pick files/folders, pick a target device, watch progress,
+see results."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog, QHBoxLayout, QLabel, QPlainTextEdit, QScrollArea,
     QStackedWidget, QVBoxLayout, QWidget,
@@ -24,29 +26,88 @@ from ..widgets import (
 from ..workers import SendThread
 
 
+def folder_summary(folder: Path) -> str:
+    """A "N files - size" summary for a folder, or why it cannot be sent.
+
+    Walking a large tree is not instant, so callers must keep this off the UI
+    thread for anything that might be big.
+    """
+    count = 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(folder, followlinks=False):
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+            count += 1
+    if not count:
+        return "empty folder"
+    return f"{count} file{'s' if count != 1 else ''}  ·  {human_size(total)}"
+
+
 class FileRow(QWidget):
     removed = Signal(object)
 
     def __init__(self, path: Path, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.path = path
+        is_folder = path.is_dir()
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(12)
-        row.addWidget(Badge(path.name, size=36))
+        if is_folder:
+            badge = QLabel()
+            badge.setFixedSize(36, 36)
+            badge.setAlignment(Qt.AlignCenter)
+            badge.setPixmap(icons.pixmap("folder", size=20,
+                                         color=PALETTE.text_secondary))
+            row.addWidget(badge)
+        else:
+            row.addWidget(Badge(path.name, size=36))
         col = QVBoxLayout()
         col.setSpacing(1)
         name_lbl = label(path.name, "body")
         col.addWidget(name_lbl)
-        try:
-            size_txt = human_size(path.stat().st_size)
-        except OSError:
-            size_txt = "unavailable"
-        col.addWidget(label(size_txt, "muted"))
+        self.detail_lbl = label("counting files..." if is_folder else "", "muted")
+        if is_folder:
+            # Summarised on a worker: a folder on a slow disk (or a huge one)
+            # must not freeze the window while it is measured.
+            self._summary = _FolderSummaryThread(path, self)
+            self._summary.done.connect(self.detail_lbl.setText)
+            self._summary.start()
+            size_txt = None
+        else:
+            try:
+                size_txt = human_size(path.stat().st_size)
+            except OSError:
+                size_txt = "unavailable"
+        if size_txt is not None:
+            self.detail_lbl.setText(size_txt)
+        col.addWidget(self.detail_lbl)
         row.addLayout(col, 1)
         remove_btn = icon_button("x", size=14, tooltip="Remove")
         remove_btn.clicked.connect(lambda: self.removed.emit(self.path))
         row.addWidget(remove_btn)
+
+
+class _FolderSummaryThread(QThread):
+    """Counts a folder's files and bytes without blocking the UI thread."""
+
+    done = Signal(str)
+
+    def __init__(self, folder: Path, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._folder = folder
+
+    def run(self) -> None:
+        try:
+            self.done.emit(folder_summary(self._folder))
+        except OSError as exc:
+            self.done.emit(f"cannot be read ({exc.strerror or exc})")
 
 
 class TargetRow(QWidget):
@@ -137,7 +198,7 @@ class SendPage(QWidget):
         row.setSpacing(20)
 
         files_card = Card()
-        files_card.addWidget(label("FILES TO SEND", "eyebrow"))
+        files_card.addWidget(label("FILES AND FOLDERS TO SEND", "eyebrow"))
 
         self.drop_area = QWidget()
         self.drop_area.setAcceptDrops(True)
@@ -154,15 +215,19 @@ class SendPage(QWidget):
         icon_lbl.setPixmap(icons.pixmap("upload_cloud", size=26, color=PALETTE.text_muted))
         icon_lbl.setAlignment(Qt.AlignCenter)
         drop_layout.addWidget(icon_lbl)
-        drop_layout.addWidget(label("Drag files here, or click Browse", "muted"))
+        drop_layout.addWidget(label("Drag files or folders here, or click Browse",
+                                    "muted"))
         files_card.addWidget(self.drop_area)
 
         browse_row = QHBoxLayout()
         browse_btn = button("Browse files...", cls="secondary", icon_name="plus")
         browse_btn.clicked.connect(self._browse_files)
         browse_row.addWidget(browse_btn)
+        folder_btn = button("Add folder...", cls="secondary", icon_name="folder")
+        folder_btn.clicked.connect(self._browse_folder)
+        browse_row.addWidget(folder_btn)
         browse_row.addWidget(h_spacer())
-        self.files_count_label = label("No files selected", "muted")
+        self.files_count_label = label("Nothing selected", "muted")
         browse_row.addWidget(self.files_count_label)
         files_card.addLayout(browse_row)
         files_card.addWidget(divider())
@@ -226,9 +291,16 @@ class SendPage(QWidget):
         files, _ = QFileDialog.getOpenFileNames(self, "Select files to send")
         self._add_files([Path(f) for f in files])
 
+    def _browse_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select a folder to send")
+        if folder:
+            self._add_files([Path(folder)])
+
     def _add_files(self, paths: List[Path]) -> None:
         for p in paths:
-            if p.is_file() and p not in self.selected_files:
+            # Folders are kept as folders: the sender walks them and the
+            # receiver rebuilds the tree, so the structure survives.
+            if (p.is_file() or p.is_dir()) and p not in self.selected_files:
                 self.selected_files.append(p)
         self._rebuild_file_list()
 
@@ -246,9 +318,15 @@ class SendPage(QWidget):
             row = FileRow(path)
             row.removed.connect(self._remove_file)
             self.files_list_layout.insertWidget(self.files_list_layout.count() - 1, row)
-        n = len(self.selected_files)
+        files = sum(1 for p in self.selected_files if not p.is_dir())
+        folders = len(self.selected_files) - files
+        parts = []
+        if files:
+            parts.append(f"{files} file{'s' if files != 1 else ''}")
+        if folders:
+            parts.append(f"{folders} folder{'s' if folders != 1 else ''}")
         self.files_count_label.setText(
-            "No files selected" if n == 0 else f"{n} file{'s' if n != 1 else ''} selected")
+            "Nothing selected" if not parts else " + ".join(parts) + " selected")
         self._update_send_enabled()
 
     def _on_peers(self, peers) -> None:
