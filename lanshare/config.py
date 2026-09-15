@@ -72,14 +72,15 @@ def write_private_bytes(path: Path, data: bytes) -> None:
         flags |= os.O_NOFOLLOW  # never write through a planted symlink
     fd = os.open(path, flags, 0o600)
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
+        fh = os.fdopen(fd, "wb")
     except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        # Only here is the descriptor still ours to close. Once fdopen has
+        # taken it, the file object owns it and closing it again could close
+        # an unrelated file that has since been given the same number.
+        os.close(fd)
         raise
+    with fh:
+        fh.write(data)
     _harden_file(path)  # no-op on POSIX, keeps intent explicit elsewhere
 
 
@@ -175,6 +176,14 @@ def save_config(cfg: Dict[str, Any]) -> None:
     tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     os.replace(tmp, path)
     _harden_file(path)
+    # The LAN check caches the trusted-network list; a newly trusted network
+    # has to take effect now, not whenever the cache happens to expire.
+    try:
+        from .netutil import invalidate_network_cache
+
+        invalidate_network_cache()
+    except Exception:  # noqa: BLE001 -- saving settings must not fail on this
+        pass
 
 
 def get_download_dir(cfg: Dict[str, Any]) -> Path:

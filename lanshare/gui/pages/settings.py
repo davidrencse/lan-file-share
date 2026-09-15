@@ -149,6 +149,28 @@ class SettingsPage(QWidget):
         card.addLayout(save_row)
         return card
 
+    def on_show(self) -> None:
+        """Re-read settings from disk every time the page is opened.
+
+        The page is built once at startup, so without this the fields keep
+        whatever they were given then. Anything that changes a setting
+        elsewhere -- the setup wizard renaming the device, most obviously --
+        would leave a stale value on screen, and pressing "Save changes" would
+        then write that stale value back over the new one.
+        """
+        self.controller.reload_config()
+        cfg = self.controller.config
+        self.name_edit.setText(cfg["device_name"])
+        self.dir_edit.setText(str(cfg_mod.get_download_dir(cfg)))
+        self.port_spin.setValue(int(cfg["port"]))
+        self._max_bytes_exact = int(cfg["max_file_bytes"])
+        self._max_size_shown = human_size(self._max_bytes_exact).replace(" ", "")
+        self.max_size_edit.setText(self._max_size_shown)
+        self.discovery_toggle.setChecked(
+            bool(cfg.get("discovery_enabled", True)), animate=False)
+        self.save_status.setText("")
+        self.secret_edit.setText(self._current_secret_display())
+
     def _browse_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Choose download folder", self.dir_edit.text())
         if d:

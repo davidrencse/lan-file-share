@@ -51,7 +51,7 @@ def missing_dependency_help(module: str, *, purpose: str = "") -> str:
         if shutil.which(manager) and module in packages:
             lines += [
                 "",
-                f"Install it with your package manager:",
+                "Install it with your package manager:",
                 f"    {_INSTALL_VERB[manager]} {packages[module]}",
             ]
             if manager == "pacman" and module == "PySide6":

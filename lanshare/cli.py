@@ -88,8 +88,6 @@ def _cmd_show_secret(args: argparse.Namespace) -> int:
 
 def _cmd_info(args: argparse.Namespace) -> int:
     identity = _identity()
-    from .netutil import local_ipv4_addresses
-
     cfg = cfg_mod.load_config()
     fpr = identity.own_fingerprint()
     print(f"LANShare {__version__}")
@@ -126,6 +124,12 @@ def _cmd_config(args: argparse.Namespace) -> int:
         cfg["download_dir"] = args.dir
         changed = True
     if args.port is not None:
+        # Validated here rather than silently reverted on the next load: an
+        # out-of-range port used to be accepted, dropped by the config coercion
+        # and reported back as "Configuration updated".
+        if not 0 <= args.port <= 65535:
+            print(f"Not a valid port: {args.port} (use 0-65535)", file=sys.stderr)
+            return 1
         cfg["port"] = args.port
         changed = True
     if args.max_size is not None:

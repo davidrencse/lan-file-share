@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QUrl, Qt, Signal
+from PySide6.QtCore import QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget,
@@ -39,7 +39,11 @@ def reveal_in_folder(path: Path) -> bool:
     """
     try:
         if os.name == "nt":
-            subprocess.Popen(["explorer", f"/select,{path}"])
+            # Explorer needs /select and the path as ONE argument with the path
+            # quoted inside it. Passing a list lets subprocess quote the whole
+            # "/select,C:\\some path\\file" as a single quoted token, which
+            # Explorer does not parse -- it silently opens Documents instead.
+            subprocess.Popen(f'explorer /select,"{path}"')
             return True
         if sys.platform == "darwin":
             subprocess.Popen(["open", "-R", str(path)])

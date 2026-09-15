@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lanshare"
-version = "1.0.0"
+version = "1.0.0a1"
 description = "Reasonably secure cross-platform LAN file sharing (Windows <-> Linux)."
 readme = "README.md"
 requires-python = ">=3.8"

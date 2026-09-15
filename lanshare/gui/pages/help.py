@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
 )
 
 from ... import config as cfg_mod
-from ... import identity
 from ...netutil import describe_local_networks, primary_lan_address
 from ..controller import AppController
 from ..theme import FONT_MONO, PALETTE

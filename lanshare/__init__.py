@@ -14,7 +14,7 @@ network. Every transfer is:
 See the README for usage.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.0a1"
 
 # Wire-protocol version. Bump when the framing / message shapes change.
 PROTOCOL_VERSION = 2

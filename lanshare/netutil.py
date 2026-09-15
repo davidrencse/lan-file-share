@@ -7,6 +7,8 @@ import json
 import os
 import socket
 import struct
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -82,8 +84,25 @@ def _on_a_local_network(addr) -> bool:
     return False
 
 
+_EXTRA_TTL = 15.0  # matches localnet's interface cache
+_extra_lock = threading.Lock()
+_extra_cache: Optional[List[ipaddress.IPv4Network]] = None
+_extra_at = 0.0
+
+
 def _extra_local_networks() -> List[ipaddress.IPv4Network]:
-    """Networks the user has explicitly declared local, from the config file."""
+    """Networks the user has explicitly declared local, from the config file.
+
+    Cached briefly. This is consulted for every address that is not obviously
+    private -- including every UDP discovery packet on a network that hands out
+    public-range addresses -- and reading and parsing config.json each time
+    turned a packet into a disk read.
+    """
+    global _extra_cache, _extra_at
+    now = time.monotonic()
+    with _extra_lock:
+        if _extra_cache is not None and (now - _extra_at) < _EXTRA_TTL:
+            return list(_extra_cache)
     try:
         from . import config as cfg_mod
 
@@ -96,7 +115,17 @@ def _extra_local_networks() -> List[ipaddress.IPv4Network]:
             nets.append(ipaddress.ip_network(str(item), strict=False))
         except ValueError:
             continue
+    with _extra_lock:
+        _extra_cache = nets
+        _extra_at = now
     return nets
+
+
+def invalidate_network_cache() -> None:
+    """Forget the cached trusted networks (call after changing settings)."""
+    global _extra_cache
+    with _extra_lock:
+        _extra_cache = None
 
 
 def describe_local_networks() -> str:
@@ -139,8 +168,25 @@ def primary_lan_address() -> Optional[str]:
     return None
 
 
-def local_ipv4_addresses() -> List[str]:
-    """This host's own IPv4 addresses, primary first, then the rest sorted."""
+_ADDR_TTL = 10.0
+_addr_lock = threading.Lock()
+_addr_cache: Optional[List[str]] = None
+_addr_at = 0.0
+
+
+def local_ipv4_addresses(force: bool = False) -> List[str]:
+    """This host's own IPv4 addresses, primary first, then the rest sorted.
+
+    Cached for a few seconds: resolving the hostname can block for as long as
+    the DNS resolver takes, and the discovery poller asks for this on every
+    round to decide which interfaces to broadcast from.
+    """
+    global _addr_cache, _addr_at
+    now = time.monotonic()
+    with _addr_lock:
+        if not force and _addr_cache is not None and (now - _addr_at) < _ADDR_TTL:
+            return list(_addr_cache)
+
     addrs: set[str] = set()
     try:
         hostname = socket.gethostname()
@@ -153,7 +199,11 @@ def local_ipv4_addresses() -> List[str]:
         addrs.add(primary)
     addrs.discard("0.0.0.0")
     rest = sorted(a for a in addrs if a and a != primary)
-    return ([primary] if primary else []) + rest
+    result = ([primary] if primary else []) + rest
+    with _addr_lock:
+        _addr_cache = result
+        _addr_at = now
+    return list(result)
 
 
 # Ranges belonging to hypervisors and container runtimes. Only used to explain

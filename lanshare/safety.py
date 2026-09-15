@@ -275,9 +275,10 @@ def reserve_destination_at(root: Path, relpath: str) -> Path:
     so a subdirectory that already exists as a symlink pointing elsewhere is
     caught instead of being written through.
 
-    *relpath* must already have been through :func:`sanitize_relpath`.
+    *relpath* must already have been through :func:`sanitize_relpath`, and
+    *root* must already be a resolved path (:func:`reserve_batch_root` returns
+    one).
     """
-    root = root.resolve()
     parts = relpath.split("/")
     if len(parts) > MAX_RELPATH_DEPTH:
         raise UnsafeFileError("path is nested too deeply")
@@ -288,13 +289,16 @@ def reserve_destination_at(root: Path, relpath: str) -> Path:
         try:
             os.mkdir(parent, 0o700)
         except FileExistsError:
+            # Already there. It must be a real directory and not a link: a
+            # symlink here is the one way a component could lead out of the
+            # tree, since the name itself cannot (sanitize_relpath refuses
+            # traversal) and the root is already resolved.
             if parent.is_symlink() or not parent.is_dir():
                 raise UnsafeFileError(
                     "destination path component is not a real directory"
                 ) from None
         except OSError as exc:
             raise UnsafeFileError(f"cannot create destination: {exc}") from exc
-        _assert_within(root, parent)
 
     leaf = parts[-1]
     stem, ext = os.path.splitext(leaf)

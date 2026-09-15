@@ -25,6 +25,10 @@ from ..widgets import (
 )
 from ..workers import SendThread
 
+# The results screen builds one widget per row; a folder send can return
+# thousands of results, so only this many are rendered.
+_MAX_RESULT_ROWS = 100
+
 
 def folder_summary(folder: Path) -> str:
     """A "N files - size" summary for a folder, or why it cannot be sent.
@@ -430,7 +434,15 @@ class SendPage(QWidget):
         self.stack.setCurrentIndex(1)
 
         for path in self.selected_files:
-            pr = ProgressRow(path.name, path.stat().st_size)
+            if path.is_dir():
+                # A folder's per-file rows appear as the sender reports them;
+                # there can be thousands, so they are not pre-created.
+                continue
+            try:
+                total = path.stat().st_size
+            except OSError:
+                total = 0   # vanished since it was picked; the send will say so
+            pr = ProgressRow(path.name, total)
             self._progress_rows[path.name] = pr
             self.sending_rows_layout.insertWidget(self.sending_rows_layout.count() - 1, pr)
 
@@ -447,9 +459,20 @@ class SendPage(QWidget):
     def _on_send_progress(self, filename: str, sent: int, total: int, phase: str) -> None:
         row = self._progress_rows.get(filename)
         if row is None:
-            return
+            row = ProgressRow(filename, total)
+            self._progress_rows[filename] = row
+            self.sending_rows_layout.insertWidget(
+                self.sending_rows_layout.count() - 1, row)
+            self._trim_progress_rows()
         row.set_phase("Computing checksum..." if phase == "hashing" else "Sending...")
         row.set_progress(sent, total)
+
+    def _trim_progress_rows(self, keep: int = 6) -> None:
+        """Drop the oldest rows: a folder can hold thousands of files."""
+        while len(self._progress_rows) > keep:
+            oldest = next(iter(self._progress_rows))
+            widget = self._progress_rows.pop(oldest)
+            widget.setParent(None)
 
     def _on_send_log(self, msg: str) -> None:
         self.send_log.appendPlainText(msg.strip())
@@ -536,11 +559,19 @@ class SendPage(QWidget):
                 "check_circle" if all_ok else "alert_triangle", size=48,
                 color=PALETTE.success if all_ok else PALETTE.warning))
             self.done_title.setText(f"{ok_count}/{len(results)} file(s) delivered")
-            for r in results:
+            # Failures first, and only a screenful: a folder send can produce
+            # thousands of results and building a widget for each one would
+            # lock up the window for seconds to show a list nobody can read.
+            ordered = sorted(results, key=lambda r: bool(r.get("sent")))
+            shown = ordered[:_MAX_RESULT_ROWS]
+            for r in shown:
                 row = QHBoxLayout()
                 row.setContentsMargins(0, 0, 0, 0)
                 row.setSpacing(10)
-                name = Path(r["file"]).name
+                # For a folder this is "photos/2024/beach.jpg" -- the bare
+                # base name would not say which of several same-named files
+                # this row is about.
+                name = str(r.get("name") or Path(r["file"]).name)
                 ok = bool(r.get("sent"))
                 ic = QLabel()
                 ic.setFixedWidth(18)
@@ -554,6 +585,11 @@ class SendPage(QWidget):
                 wrap = QWidget()
                 wrap.setLayout(row)
                 self.done_list_layout.addWidget(wrap)
+            if len(ordered) > len(shown):
+                more = label(f"...and {len(ordered) - len(shown)} more "
+                             f"(see the Files page for the full list)", "muted")
+                more.setWordWrap(True)
+                self.done_list_layout.addWidget(more)
 
         self.stack.setCurrentIndex(2)
 

@@ -21,7 +21,12 @@ allowed to talk to each other. You generate it on one machine and paste it on th
 
 ## Step 1 — Install on your Windows PC
 
-Open PowerShell in the folder you cloned this into:
+**The easy way (alpha build):** download `LANShare-1.0.0a1-windows-amd64.zip`, unzip it
+anywhere, and double-click `LANShare.exe`. Nothing to install — Python and Qt are inside the
+executable. Because the alpha builds are not code-signed yet, Windows shows *"Windows protected
+your PC"* the first time: click **More info → Run anyway**.
+
+**From source instead** — open PowerShell in the folder you cloned this into:
 
 ```powershell
 pip install -r requirements-gui.txt
@@ -271,6 +276,33 @@ Honest limitations (it's "reasonably secure", not a hardened product):
 python tests/test_lanshare.py   # or: pytest -q
 python -m lanshare selftest     # full loopback transfer, no second machine needed
 ```
+
+## Building the standalone executables
+
+The Windows alpha is built with PyInstaller. Whatever interpreter you build with is what gets
+bundled, so build in a clean virtual environment:
+
+```powershell
+python -m venv .venv-build
+.\.venv-build\Scripts\pip install PySide6 cryptography pyinstaller
+.\.venv-build\Scripts\python packaging\build.py --clean
+```
+
+That produces, in `dist/`:
+
+| File | What it is |
+|---|---|
+| `LANShare.exe` | the desktop GUI, windowed, ~51 MB |
+| `lanshare-cli.exe` | the same tool for the command line, ~13 MB |
+| `LANShare-<version>-windows-amd64.zip` | both of the above plus tester instructions |
+| `SHA256SUMS.txt` | checksums for all three |
+
+The app icon in `packaging/lanshare.ico` is generated from the same QPainter shield the GUI
+draws (`packaging/make_icon.py`), so there is no artwork file to keep in sync.
+
+Worth knowing if you touch `packaging/lanshare.spec`: the two executables must not differ only
+by letter case. Windows paths are case-insensitive, so naming the CLI `lanshare.exe` next to
+`LANShare.exe` makes them the same file, and the second one built silently replaces the first.
 
 # License
 

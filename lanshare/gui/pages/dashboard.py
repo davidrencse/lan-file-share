@@ -16,7 +16,7 @@ from ..controller import AppController
 from ..dialogs import ManualTargetDialog
 from ..theme import PALETTE
 from ..widgets import (
-    Badge, Card, EmptyState, ProgressRow, ToggleSwitch, button, divider,
+    Card, EmptyState, ProgressRow, ToggleSwitch, button, divider,
     h_spacer, icon_button, label,
 )
 from ... import config as cfg_mod

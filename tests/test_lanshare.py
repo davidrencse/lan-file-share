@@ -5,7 +5,9 @@ The tests use a temporary LANSHARE_HOME so they never touch real config.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import os
 import socket
 import sys
@@ -333,7 +335,8 @@ def _run_receiver_once(receiver, ready, errbox):
 
 
 def _do_transfer(approval, files, secret_recv="round-trip-secret",
-                 secret_send="round-trip-secret"):
+                 secret_send="round-trip-secret",
+                 max_file_bytes=10 * 1024 * 1024):
     from lanshare import config as cfg_mod
     from lanshare import identity
     from lanshare.receiver import Receiver
@@ -346,7 +349,7 @@ def _do_transfer(approval, files, secret_recv="round-trip-secret",
     cfg["device_name"] = "rt-receiver"
     cfg["download_dir"] = str(dl)
     cfg["discovery_enabled"] = False
-    cfg["max_file_bytes"] = 10 * 1024 * 1024
+    cfg["max_file_bytes"] = max_file_bytes
     cfg_mod.save_config(cfg)
     identity.ensure_identity(cfg["device_name"])
 
@@ -436,6 +439,12 @@ def test_reserve_destination_at_refuses_a_symlinked_subdirectory():
     _expect_unsafe(safety.reserve_destination_at, root, "escape/evil.txt")
     assert not (outside / "evil.txt").exists()
 
+    # Second layer: a planted symlink named like the incoming file itself is
+    # caught when the final destination is resolved, not written through.
+    os.symlink(outside / "target.txt", root / "leaf.txt")
+    _expect_unsafe(safety.reserve_destination_at, root, "leaf.txt")
+    assert list(outside.iterdir()) == []
+
 
 def _make_tree(root: Path):
     """A small nested tree, returned as {relative path: bytes}."""
@@ -487,6 +496,29 @@ def test_round_trip_folder_is_one_approval_and_keeps_its_tree():
     assert [p.name for p in dl.iterdir()] == ["photos"]
     # Results (and so history) name files by their path inside the folder.
     assert {r["name"] for r in results} == {f"photos/{rel}" for rel in files}
+
+
+def test_folder_transfer_records_every_file_in_history():
+    """Buffered history writes must all be flushed, with folder-relative names."""
+    from lanshare import history
+
+    folder, files = _folder_to_send()
+    history.clear()
+    dl, results, err, rerr = _do_transfer(lambda info: True, [str(folder)])
+    assert err is None, err
+
+    records = history.load(limit=10_000)
+    received = {r.name for r in records if r.direction == history.RECEIVED}
+    sent = {r.name for r in records if r.direction == history.SENT}
+    expected = {f"photos/{rel}" for rel in files}
+    assert received == expected, received
+    assert sent == expected, sent
+    # A received record points at the file that actually landed.
+    for rec in records:
+        if rec.direction == history.RECEIVED:
+            assert rec.status == history.OK
+            assert rec.path and Path(rec.path).exists()
+    history.clear()
 
 
 def test_round_trip_folder_declined_writes_nothing():
@@ -560,6 +592,379 @@ def test_nested_offer_outside_a_batch_is_still_flattened():
     assert prompts[0]["safe_name"] == "pwned.bin"
     assert [p.name for p in dl.iterdir()] == ["pwned.bin"]
     assert (dl / "pwned.bin").read_bytes() == b"payload"
+
+
+def test_round_trip_large_file_uses_the_streaming_path():
+    """Files above the inline threshold are hashed and sent by streaming.
+
+    Small files are read once into memory; larger ones take a separate code
+    path that reads in chunks, so both need to be exercised byte for byte.
+    """
+    from lanshare import sender as sender_mod
+
+    workdir = Path(tempfile.mkdtemp(prefix="lanshare-src-"))
+    src = workdir / "big.bin"
+    size = sender_mod._INLINE_MAX + 3 * 1024 * 1024 + 517
+    payload = os.urandom(size)
+    src.write_bytes(payload)
+    assert src.stat().st_size > sender_mod._INLINE_MAX  # really the other path
+
+    dl, results, err, rerr = _do_transfer(lambda info: True, [str(src)],
+                                          max_file_bytes=64 * 1024 * 1024)
+    assert err is None, err
+    assert results and results[0]["sent"], results
+    stored = dl / results[0]["stored_as"]
+    assert stored.stat().st_size == size
+    assert stored.read_bytes() == payload
+
+
+def test_rejection_reason_does_not_leak_the_size_limit():
+    """A peer learns that its file was too big, not what this device's cap is."""
+    src = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "big.bin"
+    src.write_bytes(b"x" * 4096)
+
+    dl, results, err, rerr = _do_transfer(lambda info: True, [str(src)],
+                                          max_file_bytes=1024)
+    assert err is None, err
+    assert results and results[0]["sent"] is False
+    reason = results[0]["reason"]
+    # No byte counts of any kind: the configured ceiling is this device's
+    # business, and the sender only needs to know the file was refused.
+    assert not any(ch.isdigit() for ch in reason), reason
+    assert "1024" not in reason
+    assert str(dl) not in reason
+    assert not any(dl.iterdir())
+
+
+def test_rejection_reason_does_not_leak_free_disk_space():
+    """The free-space check must not report this device's disk to the peer.
+
+    Any paired peer could otherwise read the exact number of free bytes off
+    this machine by offering an impossibly large file -- and that is refused
+    before the prompt, so the user would never even see it happen.
+    """
+    import lanshare.receiver as receiver_mod
+
+    src = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "a.bin"
+    src.write_bytes(b"x" * 512)
+
+    real_check = receiver_mod.check_free_space
+    secret_number = "24479604736"
+
+    def fake_check(download_dir, size):
+        raise receiver_mod.UnsafeFileError(
+            f"not enough free space: need {size} bytes, "
+            f"{secret_number} available")
+
+    try:
+        receiver_mod.check_free_space = fake_check
+        dl, results, err, rerr = _do_transfer(lambda info: True, [str(src)])
+    finally:
+        receiver_mod.check_free_space = real_check
+
+    assert err is None, err
+    assert results and results[0]["sent"] is False
+    reason = results[0]["reason"]
+    assert secret_number not in reason, reason
+    assert not any(ch.isdigit() for ch in reason), reason
+    assert not any(dl.iterdir())
+
+
+def test_history_file_is_owner_only_on_posix():
+    """History names your peers, their addresses and where files landed."""
+    import stat as stat_mod
+
+    from lanshare import history
+
+    history.clear()
+    history.record_sent("secret-plans.pdf", 10, "Peer", "192.168.1.9")
+    path = history.history_path()
+    assert path.exists()
+    if os.name != "nt":   # Windows inherits the per-user profile ACL instead
+        mode = stat_mod.S_IMODE(path.stat().st_mode)
+        assert mode == 0o600, oct(mode)
+    history.clear()
+
+
+def test_nothing_on_the_wire_carries_a_local_path():
+    """Only names relative to what was selected are sent, never local paths.
+
+    The peer is told "photos/2024/beach.jpg", never
+    "C:/Users/someone/private/photos/2024/beach.jpg" -- so the transfer does
+    not disclose the sender's directory layout, user name or home directory.
+    """
+    import lanshare.sender as sender_mod
+
+    parent = Path(tempfile.mkdtemp(prefix="lanshare-private-dir-"))
+    folder = parent / "photos"
+    folder.mkdir()
+    files = _make_tree(folder)
+
+    seen = []
+    real_send_msg = sender_mod.send_msg
+
+    def recording_send_msg(tls, obj):
+        seen.append(obj)
+        return real_send_msg(tls, obj)
+
+    try:
+        sender_mod.send_msg = recording_send_msg
+        dl, results, err, rerr = _do_transfer(lambda info: True, [str(folder)])
+    finally:
+        sender_mod.send_msg = real_send_msg
+
+    assert err is None, err
+    assert seen, "no control messages were captured"
+    blob = json.dumps(seen)
+    assert str(parent) not in blob
+    assert str(folder) not in blob
+    assert str(Path.home()) not in blob
+    # The names that *are* sent are relative to the selected folder.
+    offered = {m["name"] for m in seen if m.get("type") == "offer"}
+    assert offered == set(files), offered
+    for name in offered:
+        assert not Path(name).is_absolute()
+
+
+def test_offer_without_a_checksum_is_refused():
+    """A file is reported as received only once its checksum is verified.
+
+    Accepting an offer that carries no sha256 would store it and log it as
+    "ok" having been verified against nothing at all.
+    """
+    import lanshare.sender as sender_mod
+
+    src = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "payload.bin"
+    src.write_bytes(b"REAL-CONTENT" * 100)
+
+    real_send_msg = sender_mod.send_msg
+
+    def strip_sha(tls, obj):
+        if obj.get("type") == "offer":
+            obj = {k: v for k, v in obj.items() if k != "sha256"}
+        return real_send_msg(tls, obj)
+
+    try:
+        sender_mod.send_msg = strip_sha
+        dl, results, err, rerr = _do_transfer(lambda info: True, [str(src)])
+    finally:
+        sender_mod.send_msg = real_send_msg
+
+    assert results and results[0]["sent"] is False, results
+    assert "checksum" in results[0]["reason"], results[0]["reason"]
+    assert not any(dl.iterdir())
+
+
+def test_offer_with_a_malformed_checksum_is_refused():
+    import lanshare.sender as sender_mod
+
+    src = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "payload.bin"
+    src.write_bytes(b"data" * 100)
+
+    real_send_msg = sender_mod.send_msg
+
+    for bogus in ("not-a-hash", "", "AA" * 31, None, 12345):
+        def bad_sha(tls, obj, bogus=bogus):
+            if obj.get("type") == "offer":
+                obj = dict(obj, sha256=bogus)
+            return real_send_msg(tls, obj)
+
+        try:
+            sender_mod.send_msg = bad_sha
+            dl, results, err, rerr = _do_transfer(lambda info: True, [str(src)])
+        finally:
+            sender_mod.send_msg = real_send_msg
+        assert results and results[0]["sent"] is False, (bogus, results)
+        assert not any(dl.iterdir()), bogus
+
+
+def test_a_long_hash_does_not_look_like_a_stalled_sender():
+    """Hashing happens before the offer, while the receiver waits on recv_msg.
+
+    A big file on a slow disk can take longer than the receiver's control
+    timeout, which used to drop the connection mid-transfer. The sender says
+    it is still working instead.
+    """
+    import lanshare.receiver as receiver_mod
+    import lanshare.sender as sender_mod
+
+    src = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "big-video.bin"
+    src.write_bytes(b"z" * 4096)
+
+    real_timeout = receiver_mod._CONTROL_TIMEOUT
+    real_sha = sender_mod._sha256_file
+    real_inline = sender_mod._INLINE_MAX
+
+    def slow_sha(path, display, progress_cb, cancel_event, keepalive=None):
+        waited = 0.0
+        while waited < 3.0:            # longer than the receiver will wait
+            time.sleep(0.25)
+            waited += 0.25
+            if keepalive is not None:
+                keepalive()
+        return real_sha(path, display, progress_cb, cancel_event)
+
+    try:
+        receiver_mod._CONTROL_TIMEOUT = 1.5
+        sender_mod._sha256_file = slow_sha
+        sender_mod._INLINE_MAX = 0      # force the streaming (hash-first) path
+        dl, results, err, rerr = _do_transfer(lambda info: True, [str(src)])
+    finally:
+        receiver_mod._CONTROL_TIMEOUT = real_timeout
+        sender_mod._sha256_file = real_sha
+        sender_mod._INLINE_MAX = real_inline
+
+    assert err is None, err
+    assert results and results[0]["sent"], results
+    assert (dl / "big-video.bin").read_bytes() == b"z" * 4096
+
+
+def test_the_real_hash_loop_emits_keepalives():
+    """The scaled-down test above stubs the hash; this checks the real loop."""
+    import lanshare.sender as sender_mod
+
+    src = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "big.bin"
+    src.write_bytes(os.urandom(4 * 1024 * 1024))
+
+    pings = []
+    real_interval = sender_mod._KEEPALIVE_SECONDS
+    real_chunk = sender_mod._CHUNK
+    try:
+        sender_mod._KEEPALIVE_SECONDS = 0.0    # ping at every opportunity
+        sender_mod._CHUNK = 64 * 1024          # so there are several
+        digest = sender_mod._sha256_file(src, "big.bin", None, None,
+                                         lambda: pings.append(1))
+    finally:
+        sender_mod._KEEPALIVE_SECONDS = real_interval
+        sender_mod._CHUNK = real_chunk
+
+    assert pings, "the hash loop never signalled that it was still working"
+    assert digest == hashlib.sha256(src.read_bytes()).hexdigest()
+
+
+def test_sender_reports_a_silent_receiver_clearly():
+    """No answer to an offer is a plain message, not a raw socket error."""
+    import lanshare.sender as sender_mod
+
+    src = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "a.bin"
+    src.write_bytes(b"x" * 64)
+
+    def never_answer(info):
+        time.sleep(2.0)               # longer than the shortened wait below
+        return False
+
+    real_decision_timeout = sender_mod._DECISION_TIMEOUT
+    try:
+        sender_mod._DECISION_TIMEOUT = 0.5
+        dl, results, err, rerr = _do_transfer(never_answer, [str(src)])
+    finally:
+        sender_mod._DECISION_TIMEOUT = real_decision_timeout
+
+    assert isinstance(err, sender_mod.SendError), err
+    assert "did not answer in time" in str(err), err
+
+
+def test_a_hostile_reason_cannot_smuggle_control_characters():
+    """Whatever the far end says is display text, and is treated as such."""
+    import lanshare.receiver as receiver_mod
+
+    src = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "a.bin"
+    src.write_bytes(b"x" * 64)
+
+    nasty = "\u202eDECLINED\x00" + "A" * 500
+    real_send_msg = receiver_mod.send_msg
+
+    def rude_decision(tls, obj):
+        if obj.get("type") == "decision":
+            obj = dict(obj, accept=False, reason=nasty)
+        return real_send_msg(tls, obj)
+
+    try:
+        receiver_mod.send_msg = rude_decision
+        dl, results, err, rerr = _do_transfer(lambda info: False, [str(src)])
+    finally:
+        receiver_mod.send_msg = real_send_msg
+
+    reason = results[0]["reason"]
+    assert "\u202e" not in reason and "\x00" not in reason, repr(reason)
+    assert len(reason) <= 121, len(reason)
+
+
+def test_an_empty_folder_does_not_abandon_everything_else():
+    parent = Path(tempfile.mkdtemp(prefix="lanshare-src-"))
+    (parent / "empty").mkdir()
+    good = parent / "photos"
+    good.mkdir()
+    files = _make_tree(good)
+
+    dl, results, err, rerr = _do_transfer(
+        lambda info: True, [str(parent / "empty"), str(good)])
+    assert err is None, err
+    assert len(results) == len(files)
+    assert all(r["sent"] for r in results)
+    assert (dl / "photos").is_dir()
+
+
+def test_an_empty_folder_on_its_own_says_so():
+    from lanshare.sender import SendError, send_files
+
+    empty = Path(tempfile.mkdtemp(prefix="lanshare-src-")) / "empty"
+    empty.mkdir()
+    try:
+        send_files("127.0.0.1", 1, [str(empty)], secret=b"x" * 16,
+                   device_name="t", interactive=False, show_progress=False,
+                   log_cb=lambda m: None)
+        assert False, "expected a SendError"
+    except SendError as exc:
+        assert "empty" in str(exc), exc
+
+
+def test_a_folder_chosen_by_hand_is_sent_even_if_it_is_a_symlink():
+    """Links inside a tree are skipped; one the user picked is what they meant."""
+    parent = Path(tempfile.mkdtemp(prefix="lanshare-src-"))
+    real = parent / "real-photos"
+    real.mkdir()
+    files = _make_tree(real)
+    link = parent / "linked-photos"
+    try:
+        os.symlink(real, link, target_is_directory=True)
+    except (OSError, AttributeError, NotImplementedError) as exc:
+        print(f"  (skipped: cannot create a symlink here: {exc})")
+        return
+
+    dl, results, err, rerr = _do_transfer(lambda info: True, [str(link)])
+    assert err is None, err
+    assert results and all(r["sent"] for r in results), results
+    for rel in files:
+        assert (dl / "linked-photos" / rel).exists()
+
+
+def test_tofu_warns_when_a_known_key_claims_another_device_name():
+    """A device you already trust must not silently take another one's name."""
+    from lanshare import config as cfg_mod
+    from lanshare import sender as sender_mod
+
+    fpr_laptop = "aa" * 32
+    fpr_printer = "bb" * 32
+    cfg_mod.save_known_peers({fpr_laptop: "laptop", fpr_printer: "printer"})
+
+    warnings = []
+    prompted = []
+
+    def confirm(peer_name, known_fpr, new_fpr):
+        prompted.append((peer_name, known_fpr, new_fpr))
+        return False        # user refuses
+
+    try:
+        sender_mod._check_tofu("laptop", fpr_printer, interactive=False,
+                               log=warnings.append, tofu_confirm_cb=confirm)
+        assert False, "expected the send to be aborted"
+    except sender_mod.SendError as exc:
+        assert "fingerprint change" in str(exc), exc
+
+    assert prompted, "the user was never warned"
+    assert any("NEW identity" in w for w in warnings), warnings
+    cfg_mod.save_known_peers({})
 
 
 def test_round_trip_decline():
@@ -794,15 +1199,63 @@ def test_history_is_thread_safe():
     history.clear()
 
 
-def test_history_trims_to_cap():
+def test_history_stays_bounded_and_newest_first():
+    """The file is trimmed on a high-water mark, not rewritten every append.
+
+    Rewriting per append made an N-file transfer cost O(N^2). What has to hold
+    is that the file cannot grow without bound and that a default load() still
+    returns the newest MAX_RECORDS -- not that the file is cut on every write.
+    """
     from lanshare import history
 
     history.clear()
-    for i in range(history.MAX_RECORDS + 80):
+    total = 5000
+    for i in range(total):
         history.record_sent(f"f{i}.bin", 1000, "P", "192.168.1.5")
-    records = history.load(limit=10_000)
-    assert len(records) <= history.MAX_RECORDS
-    assert records[0].name == f"f{history.MAX_RECORDS + 79}.bin"
+
+    records = history.load()
+    assert len(records) == history.MAX_RECORDS
+    assert records[0].name == f"f{total - 1}.bin"          # newest first
+    assert records[-1].name == f"f{total - history.MAX_RECORDS}.bin"
+
+    # Bounded on disk: the trim keeps it near the high-water mark, nowhere near
+    # the ~800 KB that 5000 untrimmed records would occupy.
+    size = history.history_path().stat().st_size
+    assert size <= history.TRIM_AT_BYTES * 2, size
+    history.clear()
+
+
+def test_history_is_written_byte_exact():
+    """One JSON object per LF-terminated line, on every platform.
+
+    The append path opens the file with os.open(), which is a text-mode
+    descriptor on Windows unless O_BINARY is passed -- and would then rewrite
+    every newline, mixing line endings with the trim path, which writes bytes.
+    """
+    from lanshare import history
+
+    history.clear()
+    for i in range(3):
+        history.record_sent(f"f{i}.bin", 1, "P", "192.168.1.5")
+    raw = history.history_path().read_bytes()
+    assert b"\r" not in raw, raw[:120]
+    assert raw.count(b"\n") == 3
+    assert len(history.load()) == 3
+    history.clear()
+
+
+def test_history_append_many_is_equivalent_to_repeated_appends():
+    from lanshare import history
+
+    history.clear()
+    history.append_many([
+        history.sent_record(f"b{i}.bin", 10, "P", "192.168.1.5")
+        for i in range(3)
+    ])
+    names = [r.name for r in history.load()]
+    assert names == ["b2.bin", "b1.bin", "b0.bin"]
+    history.append_many([])  # must be a no-op, not an empty line
+    assert len(history.load()) == 3
     history.clear()
 
 
