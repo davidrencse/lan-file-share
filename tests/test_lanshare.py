@@ -516,7 +516,18 @@ def test_reserve_destination_at_creates_the_tree_and_avoids_collisions():
 
 
 def test_reserve_destination_at_refuses_a_symlinked_subdirectory():
-    """A subdirectory that is really a link out must not be written through."""
+    """A subdirectory that is really a link out must not be written through.
+
+    POSIX-only: this asserts POSIX symlink-resolution semantics. On Windows
+    creating a symlink needs a privilege, and ``Path.resolve()`` of a *dangling*
+    link is version-dependent, so the "resolves outside -> rejected" model here
+    does not apply. Containment on Windows still rests on name sanitizing (no
+    separators or traversal) plus the ``O_EXCL`` claim, which this suite covers
+    on every platform via the other reserve_* tests.
+    """
+    if os.name == "nt":
+        print("  (skipped on Windows: POSIX symlink semantics)")
+        return
     d = Path(tempfile.mkdtemp())
     outside = Path(tempfile.mkdtemp())
     root = safety.reserve_batch_root(d, "photos")

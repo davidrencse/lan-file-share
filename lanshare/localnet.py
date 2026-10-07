@@ -18,6 +18,7 @@ import ipaddress
 import os
 import socket
 import struct
+import sys
 import threading
 import time
 from typing import List, Optional
@@ -172,8 +173,106 @@ def _windows_networks() -> List[ipaddress.IPv4Network]:
 # --- POSIX -----------------------------------------------------------------
 
 def _posix_networks() -> List[ipaddress.IPv4Network]:
+    """Interfaces and their prefixes on any POSIX system.
+
+    Prefers ``getifaddrs(3)`` -- which exists on Linux *and* macOS/BSD and
+    reports the netmask directly -- and only falls back to the Linux ``ioctl``
+    path if that is somehow unavailable. The ioctl path alone used to return
+    nothing on macOS (its request numbers and ``ifreq`` layout are Linux-only),
+    so a Mac silently assumed /24 for every interface.
+    """
     if os.name == "nt":
         return []
+    nets = _getifaddrs_networks()
+    if nets:
+        return nets
+    return _posix_ioctl_networks()
+
+
+# True on macOS/BSD, where a sockaddr begins with a 1-byte length then the
+# family, versus Linux where the family is a 2-byte field at offset 0.
+_BSD_SOCKADDR = sys.platform == "darwin" or "bsd" in sys.platform
+
+
+def _sockaddr_ipv4(sa_ptr) -> Optional[bytes]:
+    """The 4 address bytes of an ``AF_INET`` sockaddr, or None for anything else.
+
+    The IPv4 address sits at offset 4 of ``sockaddr_in`` on every platform
+    (family/port come first); only the location of the family byte differs, so
+    that is the single thing we special-case between Linux and BSD.
+    """
+    import ctypes
+
+    if not sa_ptr:
+        return None
+    raw = ctypes.cast(sa_ptr, ctypes.POINTER(ctypes.c_ubyte))
+    family = raw[1] if _BSD_SOCKADDR else (raw[0] | (raw[1] << 8))
+    if family != socket.AF_INET:
+        return None
+    return bytes(raw[i] for i in range(4, 8))
+
+
+def _getifaddrs_networks() -> List[ipaddress.IPv4Network]:
+    """Portable POSIX probe via ``getifaddrs(3)`` (Linux and macOS/BSD)."""
+    try:
+        import ctypes
+        import ctypes.util
+    except ImportError:
+        return []
+
+    libc_name = ctypes.util.find_library("c")
+    if not libc_name:
+        return []
+    try:
+        libc = ctypes.CDLL(libc_name, use_errno=True)
+    except OSError:
+        return []
+    if not hasattr(libc, "getifaddrs"):
+        return []
+
+    class _sockaddr(ctypes.Structure):
+        _fields_ = [("sa_family", ctypes.c_ushort), ("sa_data", ctypes.c_byte * 14)]
+
+    class _ifaddrs(ctypes.Structure):
+        pass
+
+    # Only the leading fields are declared; they share the same layout and order
+    # on Linux and macOS, and the list is walked through ``ifa_next``.
+    _ifaddrs._fields_ = [
+        ("ifa_next", ctypes.POINTER(_ifaddrs)),
+        ("ifa_name", ctypes.c_char_p),
+        ("ifa_flags", ctypes.c_uint),
+        ("ifa_addr", ctypes.POINTER(_sockaddr)),
+        ("ifa_netmask", ctypes.POINTER(_sockaddr)),
+    ]
+
+    head = ctypes.POINTER(_ifaddrs)()
+    if libc.getifaddrs(ctypes.byref(head)) != 0:
+        return []
+    nets: List[ipaddress.IPv4Network] = []
+    try:
+        node = head
+        while node:
+            entry = node.contents
+            node = entry.ifa_next
+            addr = _sockaddr_ipv4(entry.ifa_addr)
+            mask = _sockaddr_ipv4(entry.ifa_netmask)
+            if not addr or not mask:
+                continue
+            try:
+                prefix = bin(int.from_bytes(mask, "big")).count("1")
+                net = _net_from(socket.inet_ntoa(addr), prefix)
+            except (ValueError, OSError):
+                continue
+            if net:
+                nets.append(net)
+    finally:
+        libc.freeifaddrs(head)
+    return nets
+
+
+def _posix_ioctl_networks() -> List[ipaddress.IPv4Network]:
+    """Linux-only fallback using SIOCGIF* ioctls (request numbers are Linux's)."""
     try:
         import fcntl
     except ImportError:
