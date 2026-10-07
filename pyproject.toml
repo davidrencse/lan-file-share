@@ -9,7 +9,7 @@ description = "Reasonably secure cross-platform LAN file sharing (Windows <-> Li
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
-dependencies = ["cryptography>=3.4"]
+dependencies = ["cryptography>=3.4", "spake2>=0.8"]
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.5"]

@@ -47,10 +47,14 @@ COMMON_EXCLUDES = QT_EXCLUDES + [
     "numpy", "matplotlib", "PIL",
 ]
 
+# spake2 pulls in its number-theory helpers at runtime; name it explicitly so
+# PyInstaller bundles the whole package rather than just the one class import.
+HIDDEN = ["spake2"]
+
 gui_a = Analysis(
     [os.path.join(ROOT, "packaging", "entry_gui.py")],
     pathex=[ROOT],
-    hiddenimports=["lanshare.gui.pages"],
+    hiddenimports=["lanshare.gui.pages"] + HIDDEN,
     excludes=COMMON_EXCLUDES,
     noarchive=False,
 )
@@ -58,6 +62,7 @@ gui_a = Analysis(
 cli_a = Analysis(
     [os.path.join(ROOT, "packaging", "entry_cli.py")],
     pathex=[ROOT],
+    hiddenimports=HIDDEN,
     # The CLI never touches Qt; leaving PySide6 out is what keeps it small.
     excludes=COMMON_EXCLUDES + ["PySide6", "shiboken6", "lanshare.gui"],
     noarchive=False,

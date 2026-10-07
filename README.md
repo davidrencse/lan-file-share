@@ -187,6 +187,9 @@ pip install -r requirements.txt        # CLI only, no Qt
 On Debian 12+/Ubuntu 23.04+/Fedora 38+ (also PEP 668) use your distro's `python3-cryptography`
 package, or `./install.sh --cli-only`.
 
+The CLI depends on `cryptography` (TLS identity) and `spake2` (the PAKE handshake); both are
+pulled in automatically by the commands above.
+
 ---
 
 # Where things are kept
@@ -210,13 +213,18 @@ or try to connect to you.
 
 What LANShare provides:
 
-1. **Confidentiality & integrity in transit** — TLS 1.2+/1.3 encrypts the stream; a per-file
-   SHA-256 is verified end-to-end.
-2. **Mutual authentication** — both ends prove knowledge of the shared secret with an HMAC
-   exchange over two random nonces. The HMAC also covers the receiver's certificate
-   fingerprint, so an attacker who intercepts the connection (and therefore presents a
-   *different* certificate) cannot produce a valid exchange even though they don't know the
-   secret. This is the same channel-binding idea used by SCRAM.
+1. **Confidentiality & integrity in transit** — TLS encrypts the stream; a per-file SHA-256 is
+   verified end-to-end. TLS 1.3 is used whenever both peers support it, with TLS 1.2 as the
+   floor, and on 1.2 the cipher list is pinned to forward-secret AEAD suites (ECDHE + AES-GCM or
+   ChaCha20-Poly1305) so a legacy static-RSA or CBC suite can never be negotiated.
+2. **Mutual authentication (PAKE)** — both ends run a **SPAKE2** password-authenticated key
+   exchange over the shared secret, followed by a key-confirmation step. SPAKE2's defining
+   property is that observing — or even taking part in — a run reveals *nothing* that speeds up
+   guessing the secret offline: an impostor gets one online guess per connection (which the auth
+   throttle rate-limits), and a passive eavesdropper gets nothing. The key-confirmation MAC also
+   covers the receiver's certificate fingerprint, so an attacker who intercepts the connection
+   (and therefore presents a *different* certificate) cannot complete the handshake even if it
+   somehow held the secret — classic channel binding, now on top of a PAKE.
 3. **Authenticated discovery** — a query must carry an HMAC over the shared secret before it
    gets any answer, so the service does not disclose its hostname, port and fingerprint to
    unauthenticated devices, cannot be used as a reflection amplifier, and cannot be
@@ -256,11 +264,13 @@ Honest limitations (it's "reasonably secure", not a hardened product):
   brand-new device is trusted the first time you talk to it.
 - Anyone who knows your shared secret can *offer* you files (you still approve each one) and,
   if they also run a receiver, receive from you. Rotate the secret if it leaks.
-- **This is not a PAKE.** Authenticating necessarily reveals an HMAC computed with the shared
-  secret, so anyone who can get you to connect to them can attack that transcript *offline*.
-  With the generated secret (~128 bits) that is hopeless for them; with a short human-chosen
-  one it is not. Prefer the generated value — `set-secret` requires at least 12 characters, but
-  length alone is not strength.
+- **The transfer handshake is a PAKE (SPAKE2), so it leaks no offline-guessable material.**
+  One place still does: LAN **discovery** authenticates queries and replies with an HMAC over
+  the shared secret, so a passive eavesdropper who captures a discovery exchange can attack
+  *that* transcript offline. With the generated secret (~128 bits) that is hopeless for them;
+  with a short human-chosen one it is not. Prefer the generated value — `set-secret` requires at
+  least 12 characters, but length alone is not strength. (Turning discovery off, or pairing by
+  IP + fingerprint, avoids emitting those HMACs at all.)
 - The **Secret ID** shown in the UI is a truncated hash, for eyeballing that two devices match.
   It is deliberately never transmitted; putting it on the network would give an eavesdropper an
   offline check against guessed secrets.

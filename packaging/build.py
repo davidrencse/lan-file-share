@@ -3,7 +3,7 @@
     python packaging/build.py            # build into dist/
     python packaging/build.py --clean    # discard previous build artefacts
 
-Requires PySide6, cryptography and PyInstaller in the *building* interpreter --
+Requires PySide6, cryptography, spake2 and PyInstaller in the *building* interpreter --
 whatever is bundled comes from there, so build with the Python you want to ship.
 The result is dist/LANShare.exe, dist/lanshare-cli.exe and a zip of both plus
 the tester instructions, with SHA-256 sums written alongside.
@@ -35,7 +35,7 @@ def _require(module: str) -> None:
     except ImportError:
         sys.exit(
             f"error: {module} is not installed in {sys.executable}.\n"
-            f"       pip install PySide6 cryptography pyinstaller"
+            f"       pip install PySide6 cryptography spake2 pyinstaller"
         )
 
 
@@ -62,7 +62,7 @@ def main() -> int:
                     help="remove build/ and dist/ before building")
     args = ap.parse_args()
 
-    for module in ("PySide6", "cryptography", "PyInstaller"):
+    for module in ("PySide6", "cryptography", "spake2", "PyInstaller"):
         _require(module)
 
     if args.clean:

@@ -1,0 +1,50 @@
+name: CI
+
+# Run the test suite and the loopback self-test on every push and pull request.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A later push to the same branch/PR supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+        exclude:
+          # 3.8/3.9 are no longer provided on the Apple-silicon macOS runners.
+          - os: macos-latest
+            python-version: "3.8"
+          - os: macos-latest
+            python-version: "3.9"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (CLI only -- no Qt needed for tests)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Run test suite
+        run: python tests/test_lanshare.py
+
+      - name: Run loopback self-test (full TLS + PAKE + transfer stack)
+        run: python -m lanshare selftest

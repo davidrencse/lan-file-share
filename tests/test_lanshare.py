@@ -309,6 +309,96 @@ def test_auth_channel_binding_detects_fpr_mismatch():
     assert isinstance(server_err.get("e"), auth.AuthError)
 
 
+def _capture_auth_wire(secret: bytes, fpr: str = "ab" * 32):
+    """Run a full handshake, returning every control object put on the wire."""
+    a, b = socket.socketpair()
+    seen = []
+    real_send = auth.send_msg
+
+    def recording_send(sock, obj):
+        seen.append(obj)
+        return real_send(sock, obj)
+
+    def server():
+        try:
+            auth.server_authenticate(a, secret, fpr)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            a.close()
+
+    def client():
+        try:
+            auth.client_authenticate(b, secret, fpr)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            b.close()
+
+    try:
+        auth.send_msg = recording_send
+        ts = threading.Thread(target=server); tc = threading.Thread(target=client)
+        ts.start(); tc.start(); ts.join(5); tc.join(5)
+    finally:
+        auth.send_msg = real_send
+    return seen
+
+
+def test_pake_handshake_puts_no_secret_material_on_the_wire():
+    """SPAKE2's point: an observer learns nothing to guess the secret offline.
+
+    The bytes crossing the wire are SPAKE2 group elements and key-confirmation
+    MACs -- the shared secret (and any obvious derivative) must never appear.
+    """
+    secret = b"correct horse battery staple"
+    seen = _capture_auth_wire(secret)
+    assert seen, "no auth messages were captured"
+    blob = json.dumps(seen).encode()
+    assert secret not in blob
+    assert secret.hex().encode() not in blob
+    import base64 as _b64
+    assert _b64.b64encode(secret) not in blob
+    # Exactly the PAKE message + confirmation per side, nothing resembling the
+    # old plaintext nonce/HMAC challenge-response.
+    types = [m.get("type") for m in seen]
+    assert types.count("pake-msg") == 2 and types.count("pake-confirm") == 2
+    assert "auth-challenge" not in types and "auth-response" not in types
+
+
+def test_pake_messages_are_fresh_every_run():
+    """Each run is randomized, so there is no static value to pre-compute."""
+    one = _capture_auth_wire(b"a-stable-shared-secret")
+    two = _capture_auth_wire(b"a-stable-shared-secret")
+    body_one = next(m["body"] for m in one if m.get("type") == "pake-msg")
+    body_two = next(m["body"] for m in two if m.get("type") == "pake-msg")
+    assert body_one != body_two, "SPAKE2 messages repeated across runs"
+
+
+def test_tls_contexts_pin_forward_secret_aead_ciphers():
+    """Any TLS 1.2 suite we would accept must be ECDHE (PFS) + GCM/ChaCha20.
+
+    TLS 1.3 suites (names starting 'TLS_') are AEAD+PFS by construction and are
+    left to the library; what matters is that no legacy 1.2 suite -- static-RSA
+    key exchange, CBC, 3DES, RC4 -- can be negotiated.
+    """
+    import ssl as _ssl
+
+    from lanshare import identity, tlsctx
+
+    identity.ensure_identity("tls-cipher-test")
+    key_path, cert_path = identity._paths()
+    contexts = [tlsctx.client_context(), tlsctx.server_context(cert_path, key_path)]
+    for ctx in contexts:
+        assert ctx.minimum_version == _ssl.TLSVersion.TLSv1_2
+        legacy = [c["name"] for c in ctx.get_ciphers()
+                  if not c["name"].startswith("TLS_")]
+        assert legacy, "no TLS 1.2 ciphers offered at all"
+        for name in legacy:
+            assert name.startswith("ECDHE"), f"non-PFS 1.2 cipher offered: {name}"
+            assert "GCM" in name or "CHACHA20" in name, \
+                f"non-AEAD 1.2 cipher offered: {name}"
+
+
 # --- full round trip -------------------------------------------------------
 
 def _run_receiver_once(receiver, ready, errbox):
