@@ -1,10 +1,12 @@
 name: CI
 
 # Run the test suite and the loopback self-test on every push and pull request.
+# workflow_dispatch adds a "Run workflow" button so CI can be re-run on demand.
 on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
 
 # A later push to the same branch/PR supersedes an in-flight run.
 concurrency:
