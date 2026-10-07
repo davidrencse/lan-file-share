@@ -149,6 +149,10 @@ class DiscoveryResponder:
         self._stop = threading.Event()
 
     def start(self) -> None:
+        # Warm the scrypt-stretched key now, before any packet arrives, so the
+        # first real query is answered promptly instead of paying the one-off
+        # derivation cost on the receive path.
+        _discovery_key(self._secret)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         set_exclusive_bind(sock)
         sock.bind(("", self._disc_port))

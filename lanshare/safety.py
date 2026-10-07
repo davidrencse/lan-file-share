@@ -56,9 +56,22 @@ def _strip_invisibles(text: str) -> str:
     Unicode "format" (Cf) and "control" (Cc) character is dropped, which covers
     the whole family without needing an explicit blocklist.
     """
+    # Fast path for the overwhelmingly common case (plain ASCII names): the
+    # categories we strip -- format (Cf), surrogate (Cs) -- are all non-ASCII,
+    # and control (Cc) in the ASCII range is exactly what ``str.isprintable``
+    # rejects, so an ASCII *printable* string has nothing to strip. This skips
+    # the per-character category scan that otherwise dominates sanitizing a
+    # folder of thousands of files.
+    if text.isascii() and text.isprintable():
+        return text
     return "".join(
         ch for ch in text if unicodedata.category(ch) not in ("Cf", "Cc", "Cs")
     )
+
+
+def _normalize_nfc(text: str) -> str:
+    """NFC-normalize, skipping the scan for ASCII (which is always NFC)."""
+    return text if text.isascii() else unicodedata.normalize("NFC", text)
 
 
 def sanitize_display_text(raw: object, limit: int = 64) -> str:
@@ -69,7 +82,7 @@ def sanitize_display_text(raw: object, limit: int = 64) -> str:
     plain-text rendering in the GUI.
     """
     text = raw if isinstance(raw, str) else str(raw)
-    text = unicodedata.normalize("NFC", text)
+    text = _normalize_nfc(text)
     text = _strip_invisibles(_CONTROL_CHARS.sub("", text)).strip()
     if len(text) > limit:
         text = text[: limit - 1] + "…"
@@ -85,7 +98,7 @@ def sanitize_filename(raw: str) -> str:
         raise UnsafeFileError("empty file name")
 
     # Normalise first so look-alike encodings collapse to one form.
-    name = unicodedata.normalize("NFC", raw)
+    name = _normalize_nfc(raw)
 
     # Collapse any path structure: '/' is a separator on every platform, so
     # take the last component. A backslash is deliberately *not* treated as a
@@ -144,7 +157,7 @@ def sanitize_relpath(raw: str) -> str:
     if len(raw) > MAX_RELPATH_LEN:
         raise UnsafeFileError("path is too long")
 
-    raw = unicodedata.normalize("NFC", raw)
+    raw = _normalize_nfc(raw)
     parts = []
     for component in raw.split("/"):
         if component in ("", "."):
