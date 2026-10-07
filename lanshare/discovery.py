@@ -13,6 +13,17 @@ is still authenticated, for three reasons:
 So a query must carry an HMAC proving knowledge of the shared secret before it
 gets any reply at all, and the reply carries an HMAC over the querier's nonce
 so a forged reply is discarded.
+
+Unlike the transfer handshake (a SPAKE2 PAKE, see :mod:`lanshare.auth`),
+discovery is a single-shot UDP exchange with no room for a round-trip key
+agreement, so it still authenticates with an HMAC -- and an HMAC keyed directly
+on the shared secret would hand a passive eavesdropper a transcript to attack
+*offline*. To blunt that, the HMAC key is not the secret itself but a key
+**stretched from it with scrypt** (:func:`_discovery_key`). Verifying one
+guessed secret against a captured packet then costs a full scrypt evaluation
+rather than a single SHA-256, turning a fast offline search into a slow one.
+The derived key is computed once and cached, so stretching never happens on the
+packet path.
 """
 
 from __future__ import annotations
@@ -34,10 +45,55 @@ from typing import Dict, List, Optional, Sequence
 from .netutil import is_lan_address, local_ipv4_addresses, set_exclusive_bind
 from .safety import sanitize_display_text
 
-_MAGIC = "lanshare-discovery-v2"
+# Bumped from v2 when the HMAC key moved from the raw secret to a scrypt-
+# stretched key: the construction is incompatible, so the version guards a peer
+# from silently failing MAC checks against a differently-keyed counterpart.
+_MAGIC = "lanshare-discovery-v3"
 _MAX_UDP = 2048
 _NONCE_LEN = 16
 _HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+
+# scrypt work factor for stretching the shared secret into the discovery HMAC
+# key. n=2**15, r=8, p=1 is a standard interactive cost (~tens of ms, tens of
+# MiB) -- negligible once, cached, for the honest side, but multiplied across a
+# brute-force search it is what makes an offline attack on a weak secret slow.
+# The salt is a fixed application constant: both peers must derive the *same*
+# key from the *same* secret with no shared state to exchange a random salt, so
+# it domain-separates LANShare from other scrypt users rather than per-install.
+_SCRYPT_N = 1 << 15
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_SALT = b"lanshare-discovery-kdf-v1"
+_SCRYPT_DKLEN = 32
+# scrypt needs ~128*r*n bytes; give it headroom so the call is never refused.
+_SCRYPT_MAXMEM = 128 * _SCRYPT_N * _SCRYPT_R * 2 + (1 << 20)
+
+_key_lock = threading.Lock()
+_key_cache: Dict[bytes, bytes] = {}
+
+
+def _discovery_key(secret: bytes) -> bytes:
+    """Stretch *secret* into the discovery HMAC key with scrypt (cached).
+
+    Cached on the secret itself: the honest side derives one key per distinct
+    secret and reuses it for every packet, while an offline attacker testing a
+    dictionary pays the full scrypt cost for each distinct guess.
+    """
+    with _key_lock:
+        cached = _key_cache.get(secret)
+        if cached is not None:
+            return cached
+    key = hashlib.scrypt(
+        secret, salt=_SCRYPT_SALT, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
+        dklen=_SCRYPT_DKLEN, maxmem=_SCRYPT_MAXMEM,
+    )
+    with _key_lock:
+        # One secret in normal use; bound the map so a pathological caller that
+        # feeds many secrets cannot grow it without limit.
+        if len(_key_cache) > 16:
+            _key_cache.clear()
+        _key_cache[secret] = key
+    return key
 
 
 @dataclass
@@ -52,8 +108,12 @@ class Peer:
 
 
 def _mac(secret: bytes, kind: str, nonce: bytes, *fields: object) -> bytes:
-    """HMAC over length-prefixed fields (so no field can impersonate another)."""
-    h = hmac.new(secret, digestmod=hashlib.sha256)
+    """HMAC over length-prefixed fields (so no field can impersonate another).
+
+    Keyed on the scrypt-stretched secret, not the secret itself, so a captured
+    query or reply cannot be used for a fast offline guess of the secret.
+    """
+    h = hmac.new(_discovery_key(secret), digestmod=hashlib.sha256)
     h.update(_MAGIC.encode("ascii") + b"|" + kind.encode("ascii") + b"|" + nonce)
     for field in fields:
         raw = str(field).encode("utf-8")

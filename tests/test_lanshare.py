@@ -1090,9 +1090,9 @@ def test_discovery_ignores_unauthenticated_queries():
     # Hand-rolled query with no MAC, and one with a wrong MAC.
     import base64
     import json as _json
-    no_mac = _json.dumps({"magic": "lanshare-discovery-v2", "kind": "query",
+    no_mac = _json.dumps({"magic": "lanshare-discovery-v3", "kind": "query",
                           "nonce": base64.b64encode(b"x" * 16).decode()}).encode()
-    bad_mac = _json.dumps({"magic": "lanshare-discovery-v2", "kind": "query",
+    bad_mac = _json.dumps({"magic": "lanshare-discovery-v3", "kind": "query",
                            "nonce": base64.b64encode(b"x" * 16).decode(),
                            "mac": base64.b64encode(b"y" * 32).decode()}).encode()
     assert responder._build_reply(no_mac) is None
@@ -1101,7 +1101,7 @@ def test_discovery_ignores_unauthenticated_queries():
     # And with the right secret it does answer.
     from lanshare.discovery import _b64, _mac
     nonce = b"z" * 16
-    good = _json.dumps({"magic": "lanshare-discovery-v2", "kind": "query",
+    good = _json.dumps({"magic": "lanshare-discovery-v3", "kind": "query",
                         "nonce": _b64(nonce),
                         "mac": _b64(_mac(b"the-real-secret", "query", nonce))}).encode()
     reply = responder._build_reply(good)
@@ -1117,7 +1117,7 @@ def test_discovery_rejects_forged_replies():
     nonce = b"n" * 16
     # Reply MAC'd with the wrong secret -> rejected.
     forged = _json.dumps({
-        "magic": "lanshare-discovery-v2", "kind": "reply", "name": "Impostor",
+        "magic": "lanshare-discovery-v3", "kind": "reply", "name": "Impostor",
         "port": 51888, "fpr": "cd" * 32,
         "mac": _b64(_mac(b"attacker-secret", "reply", nonce, "Impostor", 51888, "cd" * 32)),
     }).encode()
@@ -1125,19 +1125,64 @@ def test_discovery_rejects_forged_replies():
     # Correctly MAC'd but bound to a *different* nonce -> rejected (replay).
     other = b"m" * 16
     replayed = _json.dumps({
-        "magic": "lanshare-discovery-v2", "kind": "reply", "name": "Real",
+        "magic": "lanshare-discovery-v3", "kind": "reply", "name": "Real",
         "port": 51888, "fpr": "ab" * 32,
         "mac": _b64(_mac(secret, "reply", other, "Real", 51888, "ab" * 32)),
     }).encode()
     assert _parse_reply(replayed, ("192.168.1.9", 51889), secret, nonce) is None
     # Genuine reply for our nonce -> accepted.
     good = _json.dumps({
-        "magic": "lanshare-discovery-v2", "kind": "reply", "name": "Real",
+        "magic": "lanshare-discovery-v3", "kind": "reply", "name": "Real",
         "port": 51888, "fpr": "ab" * 32,
         "mac": _b64(_mac(secret, "reply", nonce, "Real", 51888, "ab" * 32)),
     }).encode()
     peer = _parse_reply(good, ("192.168.1.9", 51889), secret, nonce)
     assert peer is not None and peer.name == "Real" and peer.port == 51888
+
+
+def test_discovery_key_is_stretched_with_scrypt():
+    """The HMAC key is scrypt(secret), not the secret -- so an offline guess
+    costs a full scrypt evaluation, not one SHA-256."""
+    import hashlib as _hashlib
+    import hmac as _hmac
+
+    from lanshare import discovery as d
+
+    secret = b"a-weak-human-secret"
+    key = d._discovery_key(secret)
+    # Really derived (not the raw secret), the right length, and reproducible.
+    assert key != secret and len(key) == d._SCRYPT_DKLEN
+    assert key == _hashlib.scrypt(secret, salt=d._SCRYPT_SALT, n=d._SCRYPT_N,
+                                  r=d._SCRYPT_R, p=d._SCRYPT_P,
+                                  dklen=d._SCRYPT_DKLEN, maxmem=d._SCRYPT_MAXMEM)
+    # And it is genuinely in the MAC path: a MAC keyed on the *raw* secret
+    # (what a pre-hardening peer or a naive attacker would compute) does not
+    # match the one the responder actually verifies.
+    raw = _hmac.new(secret, b"anything", _hashlib.sha256).digest()
+    hardened = _hmac.new(key, b"anything", _hashlib.sha256).digest()
+    assert raw != hardened
+
+
+def test_discovery_rejects_a_mac_keyed_on_the_raw_secret():
+    """End-to-end: a query whose MAC skips the KDF gets no reply."""
+    import base64 as _b64mod
+    import hashlib as _hashlib
+    import hmac as _hmac
+    import json as _json
+
+    from lanshare.discovery import DiscoveryResponder, _MAGIC
+
+    secret = b"the-real-secret-value"
+    responder = DiscoveryResponder("Box", 51888, 0, "ab" * 32, secret)
+    nonce = b"z" * 16
+    # Build the query MAC the *old* way -- HMAC keyed directly on the secret,
+    # bypassing scrypt. The hardened responder must not accept it.
+    body = _MAGIC.encode() + b"|" + b"query" + b"|" + nonce
+    raw_mac = _hmac.new(secret, body, _hashlib.sha256).digest()
+    forged = _json.dumps({"magic": _MAGIC, "kind": "query",
+                          "nonce": _b64mod.b64encode(nonce).decode(),
+                          "mac": _b64mod.b64encode(raw_mac).decode()}).encode()
+    assert responder._build_reply(forged) is None
 
 
 # --- the self-test must not leak its throwaway config dir -------------------
@@ -1374,7 +1419,7 @@ def test_secret_fingerprint_never_goes_on_the_wire():
 
     nonce = b"q" * 16
     import json as _json
-    query = _json.dumps({"magic": "lanshare-discovery-v2", "kind": "query",
+    query = _json.dumps({"magic": "lanshare-discovery-v3", "kind": "query",
                          "nonce": _b64(nonce),
                          "mac": _b64(_mac(secret, "query", nonce))}).encode()
     responder = DiscoveryResponder("Box", 51888, 51889, "ab" * 32, secret)

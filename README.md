@@ -225,11 +225,14 @@ What LANShare provides:
    covers the receiver's certificate fingerprint, so an attacker who intercepts the connection
    (and therefore presents a *different* certificate) cannot complete the handshake even if it
    somehow held the secret — classic channel binding, now on top of a PAKE.
-3. **Authenticated discovery** — a query must carry an HMAC over the shared secret before it
-   gets any answer, so the service does not disclose its hostname, port and fingerprint to
-   unauthenticated devices, cannot be used as a reflection amplifier, and cannot be
-   impersonated by a forged reply. When you send to a device found this way, its TLS
-   certificate is checked against the advertised fingerprint *before* authenticating.
+3. **Authenticated discovery** — a query must carry a valid HMAC before it gets any answer, so
+   the service does not disclose its hostname, port and fingerprint to unauthenticated devices,
+   cannot be used as a reflection amplifier, and cannot be impersonated by a forged reply. The
+   HMAC is keyed on a **scrypt-stretched** form of the shared secret, not the secret itself, so
+   a captured discovery packet cannot be turned into a fast offline guess of the secret —
+   checking one candidate costs a full scrypt evaluation. (The key is derived once and cached,
+   so stretching never touches the packet path.) When you send to a device found this way, its
+   TLS certificate is checked against the advertised fingerprint *before* authenticating.
 4. **Trust on first use (TOFU)** — the sender pins each receiver's certificate fingerprint and
    warns if a known device name later presents a different one. Be aware of what this does and
    does not buy you: the device name is self-reported, so a determined attacker who already has
@@ -264,13 +267,12 @@ Honest limitations (it's "reasonably secure", not a hardened product):
   brand-new device is trusted the first time you talk to it.
 - Anyone who knows your shared secret can *offer* you files (you still approve each one) and,
   if they also run a receiver, receive from you. Rotate the secret if it leaks.
-- **The transfer handshake is a PAKE (SPAKE2), so it leaks no offline-guessable material.**
-  One place still does: LAN **discovery** authenticates queries and replies with an HMAC over
-  the shared secret, so a passive eavesdropper who captures a discovery exchange can attack
-  *that* transcript offline. With the generated secret (~128 bits) that is hopeless for them;
-  with a short human-chosen one it is not. Prefer the generated value — `set-secret` requires at
-  least 12 characters, but length alone is not strength. (Turning discovery off, or pairing by
-  IP + fingerprint, avoids emitting those HMACs at all.)
+- **The transfer handshake is a PAKE (SPAKE2), so it leaks no offline-guessable material**, and
+  LAN **discovery** keys its HMACs on a scrypt-stretched secret so a captured discovery packet
+  is expensive to attack offline rather than cheap. Neither is a licence to use a trivial
+  secret: scrypt slows a guessing search, it does not stop one, so prefer the generated value —
+  `set-secret` requires at least 12 characters, but length alone is not strength. (Turning
+  discovery off, or pairing by IP + fingerprint, avoids emitting those HMACs at all.)
 - The **Secret ID** shown in the UI is a truncated hash, for eyeballing that two devices match.
   It is deliberately never transmitted; putting it on the network would give an eavesdropper an
   offline check against guessed secrets.
